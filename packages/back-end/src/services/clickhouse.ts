@@ -35,6 +35,7 @@ import {
 import {
   lockDataSource,
   unlockDataSource,
+  updateDataSource,
 } from "back-end/src/models/DataSourceModel";
 import { ensureManagedWarehouseAttributesMigrated } from "back-end/src/services/clickhouseAttributes";
 
@@ -48,6 +49,12 @@ type ClickHouseDataType =
   | "Array(Float64)";
 
 // These will eventually move to be inside of attributes
+// Columns the ingestor writes to the top-level of the `events` table. These
+// are either server-enriched (geo_*, ua_*, url_{path,host,query,fragment}) or
+// SDK-sent top-level fields (device_id, utm_*, url, …) — none of them live
+// inside `context_json`, so they aren't visible to the SDK at feature /
+// experiment assignment time. We materialize them for dimension analysis but
+// they are NOT part of the org's attributeSchema.
 const tempTopLevelFields: Record<string, ClickHouseDataType> = {
   user_id: "String",
   url: "String",
@@ -73,6 +80,44 @@ const tempTopLevelFields: Record<string, ClickHouseDataType> = {
   ua_os: "String",
   ua_device_type: "String",
 };
+
+function clickhouseTypeToFactTableType(
+  type: ClickHouseDataType,
+): FactTableColumnType {
+  switch (type) {
+    case "Float64":
+      return "number";
+    case "Boolean":
+      return "boolean";
+    case "DateTime":
+      return "date";
+    case "String":
+    case "LowCardinality(String)":
+    case "Array(String)":
+    case "Array(Float64)":
+      return "string";
+  }
+}
+
+/**
+ * Warehouse-owned materialized columns that we always maintain in ClickHouse,
+ * independent of the organization's attributeSchema. These correspond to the
+ * ingestor's enrichment + SDK top-level fields and are used for dimension
+ * analysis; they are never exposed through `attributeSchema` because they
+ * aren't available to the SDK at assignment time.
+ */
+export const WAREHOUSE_BUILTIN_COLUMNS: MaterializedColumn[] = Object.entries(
+  tempTopLevelFields,
+).map(([name, type]) => ({
+  columnName: name,
+  sourceField: name,
+  datatype: clickhouseTypeToFactTableType(type),
+  type: "dimension",
+}));
+
+export const WAREHOUSE_BUILTIN_COLUMN_NAMES: Set<string> = new Set(
+  WAREHOUSE_BUILTIN_COLUMNS.map((c) => c.columnName),
+);
 
 const REMAINING_COLUMNS_SCHEMA: Record<string, ClickHouseDataType> = {
   environment: "LowCardinality(String)",
@@ -505,13 +550,23 @@ export async function _dangerousRecreateClickhouseTables(
     logger.info(`Creating Clickhouse database ${database}`);
     await runCommand(client, `CREATE DATABASE ${database}`);
 
-    await createClickhouseTables(
-      client,
-      orgId,
-      deriveMaterializedColumnsFromAttributes(
+    const materializedColumns = [
+      ...deriveMaterializedColumnsFromAttributes(
         context.org.settings?.attributeSchema || [],
       ),
-    );
+      ...WAREHOUSE_BUILTIN_COLUMNS,
+    ];
+    await createClickhouseTables(client, orgId, materializedColumns);
+
+    // Reset the snapshot — the recreate is also the intended escape hatch for
+    // recovering from drift, and we want subsequent syncs to compare against
+    // the fresh ClickHouse state.
+    await updateDataSource(context, datasource, {
+      settings: {
+        ...datasource.settings,
+        syncedMaterializedColumns: materializedColumns,
+      },
+    });
   } finally {
     await unlockDataSource(context, datasource);
   }

@@ -123,12 +123,26 @@ describe("deriveMaterializedColumnsFromAttributes", () => {
 });
 
 describe("computeMaterializedColumnDiff", () => {
+  // Most callers (and real-world usage) build the column lists from an
+  // attributeSchema, so we use the derivation helper to keep the test inputs
+  // readable.
+  const diffFromAttributes = (
+    before: SDKAttribute[],
+    after: SDKAttribute[],
+    renames?: { from: string; to: string }[],
+  ) =>
+    computeMaterializedColumnDiff({
+      originalColumns: deriveMaterializedColumnsFromAttributes(before),
+      finalColumns: deriveMaterializedColumnsFromAttributes(after),
+      renames,
+    });
+
   it("returns empty diffs when before === after", () => {
     const attrs: SDKAttribute[] = [
       { property: "device_id", datatype: "string", hashAttribute: true },
       { property: "country", datatype: "string" },
     ];
-    const diff = computeMaterializedColumnDiff({ before: attrs, after: attrs });
+    const diff = diffFromAttributes(attrs, attrs);
     expect(diff.columnsToAdd).toEqual([]);
     expect(diff.columnsToDelete).toEqual([]);
     expect(diff.columnsToRename).toEqual([]);
@@ -143,7 +157,7 @@ describe("computeMaterializedColumnDiff", () => {
       { property: "device_id", datatype: "string", hashAttribute: true },
       { property: "new_dim", datatype: "string" },
     ];
-    const diff = computeMaterializedColumnDiff({ before, after });
+    const diff = diffFromAttributes(before, after);
     expect(diff.columnsToAdd.map((c) => c.columnName)).toEqual(["new_dim"]);
     expect(diff.columnsToDelete).toEqual(["old_dim"]);
     expect(diff.columnsToRename).toEqual([]);
@@ -154,7 +168,7 @@ describe("computeMaterializedColumnDiff", () => {
       { property: "foo", datatype: "string", archived: true },
     ];
     const after: SDKAttribute[] = [{ property: "foo", datatype: "string" }];
-    const diff = computeMaterializedColumnDiff({ before, after });
+    const diff = diffFromAttributes(before, after);
     expect(diff.columnsToAdd.map((c) => c.columnName)).toEqual(["foo"]);
     expect(diff.columnsToDelete).toEqual([]);
   });
@@ -164,7 +178,7 @@ describe("computeMaterializedColumnDiff", () => {
     const after: SDKAttribute[] = [
       { property: "foo", datatype: "string", archived: true },
     ];
-    const diff = computeMaterializedColumnDiff({ before, after });
+    const diff = diffFromAttributes(before, after);
     expect(diff.columnsToAdd).toEqual([]);
     expect(diff.columnsToDelete).toEqual(["foo"]);
   });
@@ -176,11 +190,9 @@ describe("computeMaterializedColumnDiff", () => {
     const after: SDKAttribute[] = [
       { property: "geo_country", datatype: "string" },
     ];
-    const diff = computeMaterializedColumnDiff({
-      before,
-      after,
-      renames: [{ from: "country", to: "geo_country" }],
-    });
+    const diff = diffFromAttributes(before, after, [
+      { from: "country", to: "geo_country" },
+    ]);
     expect(diff.columnsToAdd).toEqual([]);
     expect(diff.columnsToDelete).toEqual([]);
     expect(diff.columnsToRename).toEqual([
@@ -191,11 +203,9 @@ describe("computeMaterializedColumnDiff", () => {
   it("ignores a rename entry whose types don't match (falls back to add+delete)", () => {
     const before: SDKAttribute[] = [{ property: "foo", datatype: "string" }];
     const after: SDKAttribute[] = [{ property: "bar", datatype: "number" }];
-    const diff = computeMaterializedColumnDiff({
-      before,
-      after,
-      renames: [{ from: "foo", to: "bar" }],
-    });
+    const diff = diffFromAttributes(before, after, [
+      { from: "foo", to: "bar" },
+    ]);
     expect(diff.columnsToAdd.map((c) => c.columnName)).toEqual(["bar"]);
     expect(diff.columnsToDelete).toEqual(["foo"]);
     expect(diff.columnsToRename).toEqual([]);
@@ -204,7 +214,7 @@ describe("computeMaterializedColumnDiff", () => {
   it("throws when datatype changes with the same column name", () => {
     const before: SDKAttribute[] = [{ property: "foo", datatype: "string" }];
     const after: SDKAttribute[] = [{ property: "foo", datatype: "number" }];
-    expect(() => computeMaterializedColumnDiff({ before, after })).toThrow(
+    expect(() => diffFromAttributes(before, after)).toThrow(
       /Cannot change the datatype/,
     );
   });
@@ -216,12 +226,26 @@ describe("computeMaterializedColumnDiff", () => {
     const after: SDKAttribute[] = [
       { property: "user_id", datatype: "string", hashAttribute: true },
     ];
-    const diff = computeMaterializedColumnDiff({ before, after });
+    const diff = diffFromAttributes(before, after);
     expect(diff.columnsToAdd).toEqual([]);
     expect(diff.columnsToDelete).toEqual([]);
     expect(diff.columnsToRename).toEqual([]);
     expect(diff.finalColumns[0].type).toBe("identifier");
     expect(diff.originalColumns[0].type).toBe("dimension");
+  });
+
+  it("treats an empty baseline as 'add every column'", () => {
+    // Simulates the first call after initial migration when the snapshot was
+    // seeded from empty legacy columns.
+    const diff = computeMaterializedColumnDiff({
+      originalColumns: [],
+      finalColumns: deriveMaterializedColumnsFromAttributes([
+        { property: "id", datatype: "string", hashAttribute: true },
+        { property: "url", datatype: "string" },
+      ]),
+    });
+    expect(diff.columnsToAdd.map((c) => c.columnName)).toEqual(["id", "url"]);
+    expect(diff.columnsToDelete).toEqual([]);
   });
 });
 
@@ -342,5 +366,22 @@ describe("planManagedWarehouseAttributeMigration", () => {
       existingAttributes: [],
     });
     expect(result.additions.map((a) => a.property)).toEqual(["country"]);
+  });
+
+  it("skips legacy columns whose name is a warehouse built-in", () => {
+    // Ingestor-owned columns like `geo_country` and `ua_browser` aren't
+    // SDK-visible attributes, so they should never be backfilled even when
+    // they appear in the legacy materializedColumns list.
+    const result = planManagedWarehouseAttributeMigration({
+      legacyColumns: [
+        legacyCol({ sourceField: "geo_country", type: "dimension" }),
+        legacyCol({ sourceField: "ua_browser", type: "dimension" }),
+        legacyCol({ sourceField: "my_custom_attr", type: "dimension" }),
+      ],
+      existingAttributes: [],
+      warehouseBuiltinColumnNames: new Set(["geo_country", "ua_browser"]),
+    });
+    expect(result.additions.map((a) => a.property)).toEqual(["my_custom_attr"]);
+    expect(result.skipped).toEqual([]);
   });
 });

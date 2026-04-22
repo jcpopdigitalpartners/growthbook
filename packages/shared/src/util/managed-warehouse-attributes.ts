@@ -99,25 +99,22 @@ export type MaterializedColumnDiff = {
 };
 
 /**
- * Given the before/after attribute lists and an optional list of renames
- * (old property name -> new property name), produce the add/delete/rename
+ * Given the before/after materialized-column lists and an optional list of
+ * renames (old columnName -> new columnName), produce the add/delete/rename
  * plan that the ClickHouse service consumes. Throws when a column would need
  * to change datatype while keeping the same name — that scenario is not
  * supported in a single ALTER TABLE and must be handled by deleting the
  * attribute and creating a new one.
  */
 export function computeMaterializedColumnDiff({
-  before,
-  after,
+  originalColumns,
+  finalColumns,
   renames = [],
 }: {
-  before: SDKAttribute[];
-  after: SDKAttribute[];
+  originalColumns: MaterializedColumn[];
+  finalColumns: MaterializedColumn[];
   renames?: { from: string; to: string }[];
 }): MaterializedColumnDiff {
-  const originalColumns = deriveMaterializedColumnsFromAttributes(before);
-  const finalColumns = deriveMaterializedColumnsFromAttributes(after);
-
   const originalByName = new Map(originalColumns.map((c) => [c.columnName, c]));
   const finalByName = new Map(finalColumns.map((c) => [c.columnName, c]));
 
@@ -201,13 +198,21 @@ export function legacyMaterializedColumnDatatypeToAttribute(
  * Returns the list of attributes that should be appended (those whose
  * `property` isn't already present) and the list of columns we had to skip
  * because we couldn't map their datatype. Pure; no IO.
+ *
+ * `warehouseBuiltinColumnNames` is the set of columns that are maintained by
+ * the warehouse itself (ingestor-produced fields like `ua_browser`,
+ * `geo_country`, `utm_source`, …). Those never become attributes — they
+ * aren't available to the SDK at assignment time — so we silently drop them
+ * from the backfill even when they appear in the legacy list.
  */
 export function planManagedWarehouseAttributeMigration({
   legacyColumns,
   existingAttributes,
+  warehouseBuiltinColumnNames,
 }: {
   legacyColumns: MaterializedColumn[];
   existingAttributes: SDKAttribute[];
+  warehouseBuiltinColumnNames?: ReadonlySet<string>;
 }): {
   additions: SDKAttribute[];
   skipped: { columnName: string; reason: string }[];
@@ -223,6 +228,13 @@ export function planManagedWarehouseAttributeMigration({
     // attribute's `property`. columnName was historically allowed to differ
     // but in practice new-style attributes always match sourceField.
     const property = col.sourceField;
+
+    if (warehouseBuiltinColumnNames?.has(property)) {
+      // Covered by the warehouse built-in column set; not an SDK-visible
+      // attribute, so don't backfill.
+      continue;
+    }
+
     if (existingByProperty.has(property) || seenInAdditions.has(property)) {
       continue;
     }

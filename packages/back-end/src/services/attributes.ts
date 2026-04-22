@@ -71,8 +71,7 @@ export async function updateAttributeSchema(
 
   try {
     await syncManagedWarehouseAttributes(context, {
-      before: previousAttributeSchema,
-      after: nextAttributeSchema,
+      attributeSchema: nextAttributeSchema,
       renames,
     });
   } catch (e) {

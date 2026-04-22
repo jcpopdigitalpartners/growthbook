@@ -292,7 +292,19 @@ export type DataSourceSettings = {
 };
 
 export interface GrowthbookClickhouseSettings extends DataSourceSettings {
+  /**
+   * @deprecated Legacy pre-attribute-sync field. Still read once during
+   * migration to backfill attributeSchema from existing columns. Writes go
+   * to `syncedMaterializedColumns` instead.
+   */
   materializedColumns?: MaterializedColumn[];
+  /**
+   * Snapshot of the materialized column set currently in ClickHouse, written
+   * after every successful sync. Used as the "before" state when computing
+   * the next sync's diff. Absence means the datasource has never been synced
+   * under the new attribute-driven flow and migration still needs to run.
+   */
+  syncedMaterializedColumns?: MaterializedColumn[];
 }
 
 interface DataSourceBase {

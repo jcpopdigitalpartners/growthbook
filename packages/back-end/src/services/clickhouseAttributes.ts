@@ -1,5 +1,6 @@
 import {
   computeMaterializedColumnDiff,
+  deriveMaterializedColumnsFromAttributes,
   planManagedWarehouseAttributeMigration,
 } from "shared/util";
 import {
@@ -14,7 +15,27 @@ import {
   updateDataSource,
 } from "back-end/src/models/DataSourceModel";
 import { updateOrganization } from "back-end/src/models/OrganizationModel";
-import { updateMaterializedColumns } from "back-end/src/services/clickhouse";
+import {
+  updateMaterializedColumns,
+  WAREHOUSE_BUILTIN_COLUMN_NAMES,
+  WAREHOUSE_BUILTIN_COLUMNS,
+} from "back-end/src/services/clickhouse";
+
+/**
+ * Materialized column set a Managed Warehouse should contain: every non-
+ * archived, mappable attribute in the org's attributeSchema plus the
+ * warehouse's own built-in columns (ingestor-enriched + SDK top-level fields).
+ * Built-ins never overlap with attribute columns because the migration and
+ * seed paths both exclude built-in names from attributeSchema.
+ */
+export function getWarehouseMaterializedColumns(
+  attributes: SDKAttribute[],
+): MaterializedColumn[] {
+  return [
+    ...deriveMaterializedColumnsFromAttributes(attributes),
+    ...WAREHOUSE_BUILTIN_COLUMNS,
+  ];
+}
 
 /**
  * Derive the portion of a Managed Warehouse datasource's settings that is
@@ -62,19 +83,24 @@ WHERE
 }
 
 /**
- * Lazily migrate a Managed Warehouse datasource away from its legacy
- * `settings.materializedColumns` representation:
- *   - Any legacy column without a matching attribute is backfilled onto
- *     `org.settings.attributeSchema` (`hashAttribute: true` when it was an
- *     identifier). Existing attributes are left alone.
- *   - `datasource.settings.materializedColumns` is cleared.
+ * One-time migration for Managed Warehouses that predate the attribute-driven
+ * flow. Runs at most once per datasource — gated on
+ * `settings.syncedMaterializedColumns` being undefined. Work done:
+ *   - Backfill `attributeSchema` with an entry for any legacy
+ *     `materializedColumns` whose `sourceField` isn't already an attribute.
+ *     `hashAttribute: true` when the legacy column was an identifier.
+ *   - Seed `syncedMaterializedColumns` on the datasource with the legacy
+ *     column set — that's exactly what ClickHouse currently contains.
+ *   - Drop `settings.materializedColumns`.
  *
- * Idempotent. Returns the attributes that were added so callers can merge
- * them into any in-flight updates to attributeSchema. No-op when the org
- * has no Managed Warehouse datasource or the datasource is already migrated.
+ * Intentionally does NOT run ALTER TABLE or recreate views; the caller's
+ * subsequent sync will diff the new snapshot against the target attribute
+ * schema and do that work.
  *
- * The context's `org.settings` is mutated in place so subsequent reads in
- * the same request see the backfilled schema.
+ * Returns the attributes that were added so callers can merge them into any
+ * in-flight updates to attributeSchema (the caller's `nextAttributeSchema`
+ * was computed against the pre-migration schema and would otherwise drop
+ * the backfilled entries).
  */
 export async function ensureManagedWarehouseAttributesMigrated(
   context: ReqContext,
@@ -84,13 +110,17 @@ export async function ensureManagedWarehouseAttributesMigrated(
   )) as GrowthbookClickhouseDataSource | null;
   if (!datasource) return [];
 
-  const legacyColumns = datasource.settings.materializedColumns;
-  if (!legacyColumns || legacyColumns.length === 0) return [];
+  if (datasource.settings.syncedMaterializedColumns !== undefined) return [];
 
+  const legacyColumns = datasource.settings.materializedColumns || [];
   const existingAttributes = context.org.settings?.attributeSchema || [];
   const { additions, skipped } = planManagedWarehouseAttributeMigration({
     legacyColumns,
     existingAttributes,
+    // Warehouse built-ins (geo_*, ua_*, utm_*, url_*, …) are maintained
+    // outside of attributeSchema, so don't create attributes for them even
+    // when they appear in the legacy list.
+    warehouseBuiltinColumnNames: WAREHOUSE_BUILTIN_COLUMN_NAMES,
   });
 
   if (skipped.length > 0) {
@@ -100,17 +130,16 @@ export async function ensureManagedWarehouseAttributesMigrated(
     );
   }
 
-  const migratedSchema = [...existingAttributes, ...additions];
-
   if (additions.length > 0) {
+    const mergedSchema = [...existingAttributes, ...additions];
     await updateOrganization(context.org.id, {
-      settings: { ...context.org.settings, attributeSchema: migratedSchema },
+      settings: { ...context.org.settings, attributeSchema: mergedSchema },
     });
-    // Keep the in-memory context in sync so the caller's subsequent reads
-    // of org.settings.attributeSchema see the backfilled entries.
+    // Keep the in-memory context in sync so the caller's subsequent reads of
+    // org.settings.attributeSchema see the backfilled entries.
     context.org.settings = {
       ...context.org.settings,
-      attributeSchema: migratedSchema,
+      attributeSchema: mergedSchema,
     };
     logger.info(
       {
@@ -121,41 +150,37 @@ export async function ensureManagedWarehouseAttributesMigrated(
     );
   }
 
-  // Clear the legacy field before calling sync so the re-fetched datasource
-  // inside sync has the cleaned settings. (updateDataSource writes the whole
-  // `settings` field via $set, so doing this after sync would clobber the
-  // userIdTypes / exposure queries sync just wrote.)
+  // Seed the snapshot with exactly what's in ClickHouse right now, and drop
+  // the legacy field. updateDataSource uses $set on the whole settings object,
+  // so we rebuild it explicitly.
   const { materializedColumns: _legacy, ...restSettings } = datasource.settings;
-  await updateDataSource(context, datasource, { settings: restSettings });
-
-  // Bring ClickHouse in sync with the full post-migration attributeSchema.
-  // `before` represents current ClickHouse state, which is exactly the set of
-  // attributes we just backfilled from legacy columns. Any other attribute in
-  // `migratedSchema` (e.g. the GrowthBook default `id`, `url`, `path`, …) will
-  // be ADDed to ClickHouse now so the DDL and attributeSchema stay aligned.
-  await syncManagedWarehouseAttributes(context, {
-    before: additions,
-    after: migratedSchema,
+  await updateDataSource(context, datasource, {
+    settings: {
+      ...restSettings,
+      syncedMaterializedColumns: legacyColumns,
+    },
   });
 
   return additions;
 }
 
 /**
- * Keep the Managed Warehouse datasource in sync with an attributeSchema change.
- * - runs ALTER TABLE / view recreation to match the new attribute list
- * - refreshes derived userIdTypes + exposure queries on the datasource
+ * Bring ClickHouse in line with the given attributeSchema. Uses the datasource's
+ * `syncedMaterializedColumns` snapshot as the "what CH currently has" baseline,
+ * computes a diff, runs the ALTER TABLE / view recreation, and persists a fresh
+ * snapshot on success.
+ *
  * No-op when the organization doesn't have a Managed Warehouse datasource.
+ * Callers must run `ensureManagedWarehouseAttributesMigrated` first to make
+ * sure the snapshot is populated.
  */
 export async function syncManagedWarehouseAttributes(
   context: ReqContext,
   {
-    before,
-    after,
+    attributeSchema,
     renames = [],
   }: {
-    before: SDKAttribute[];
-    after: SDKAttribute[];
+    attributeSchema: SDKAttribute[];
     renames?: { from: string; to: string }[];
   },
 ): Promise<void> {
@@ -164,7 +189,13 @@ export async function syncManagedWarehouseAttributes(
   )) as GrowthbookClickhouseDataSource | null;
   if (!datasource) return;
 
-  const diff = computeMaterializedColumnDiff({ before, after, renames });
+  const originalColumns = datasource.settings.syncedMaterializedColumns || [];
+  const finalColumns = getWarehouseMaterializedColumns(attributeSchema);
+  const diff = computeMaterializedColumnDiff({
+    originalColumns,
+    finalColumns,
+    renames,
+  });
 
   const hasDDLWork =
     diff.columnsToAdd.length > 0 ||
@@ -183,12 +214,11 @@ export async function syncManagedWarehouseAttributes(
     });
   }
 
-  // Always refresh the derived settings — even when the DDL didn't change,
-  // hashAttribute flips (dimension <-> identifier) still need to propagate
-  // into userIdTypes and the auto-generated exposure queries.
-  const { userIdTypes, exposureQueries } = getManagedWarehouseDerivedSettings(
-    diff.finalColumns,
-  );
+  // Always refresh derived settings and the snapshot — hashAttribute flips
+  // (identifier <-> dimension) don't require DDL but still change userIdTypes
+  // and the exposure queries.
+  const { userIdTypes, exposureQueries } =
+    getManagedWarehouseDerivedSettings(finalColumns);
 
   await updateDataSource(context, datasource, {
     dateUpdated: new Date(),
@@ -199,6 +229,7 @@ export async function syncManagedWarehouseAttributes(
         ...datasource.settings.queries,
         exposure: exposureQueries,
       },
+      syncedMaterializedColumns: finalColumns,
     },
   });
 }

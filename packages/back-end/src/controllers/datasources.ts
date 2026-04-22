@@ -20,9 +20,8 @@ import {
   DataSourceInterface,
   ExposureQuery,
   DataSourceInterfaceWithParams,
+  GrowthbookClickhouseSettings,
 } from "shared/types/datasource";
-import { SDKAttribute } from "shared/types/organization";
-import { deriveMaterializedColumnsFromAttributes } from "shared/util";
 import { GoogleAnalyticsParams } from "shared/types/integrations/googleanalytics";
 import { SQLExecutionError } from "back-end/src/util/errors";
 import { AuthRequest } from "back-end/src/types/AuthRequest";
@@ -71,8 +70,10 @@ import {
   _dangerousRecreateClickhouseTables,
   createClickhouseUser,
 } from "back-end/src/services/clickhouse";
-import { getManagedWarehouseDerivedSettings } from "back-end/src/services/clickhouseAttributes";
-import { updateOrganization } from "back-end/src/models/OrganizationModel";
+import {
+  getManagedWarehouseDerivedSettings,
+  getWarehouseMaterializedColumns,
+} from "back-end/src/services/clickhouseAttributes";
 import { UNITS_TABLE_PREFIX } from "back-end/src/queryRunners/ExperimentResultsQueryRunner";
 import { getExperimentsByTrackingKeys } from "back-end/src/models/ExperimentModel";
 
@@ -297,29 +298,29 @@ export async function postManagedWarehouse(
     context.permissions.throwPermissionError();
   }
 
-  // Seed any default Managed Warehouse attributes that the org doesn't already
-  // have. These drive the initial set of materialized columns in ClickHouse.
-  await seedDefaultManagedWarehouseAttributes(context);
-
   const attributeSchema = context.org.settings?.attributeSchema || [];
-  const materializedColumns =
-    deriveMaterializedColumnsFromAttributes(attributeSchema);
+  const materializedColumns = getWarehouseMaterializedColumns(attributeSchema);
 
   const params = await createClickhouseUser(context, materializedColumns);
   const { userIdTypes, exposureQueries } =
     getManagedWarehouseDerivedSettings(materializedColumns);
+
+  // Seed the snapshot so the migration helper knows this datasource is
+  // already aligned with attributeSchema and skips on first attribute write.
+  const initialSettings: GrowthbookClickhouseSettings = {
+    userIdTypes,
+    queries: {
+      exposure: exposureQueries,
+    },
+    syncedMaterializedColumns: materializedColumns,
+  };
 
   const datasource = await createDataSource(
     context,
     "Managed Warehouse",
     "growthbook_clickhouse",
     params,
-    {
-      userIdTypes,
-      queries: {
-        exposure: exposureQueries,
-      },
-    },
+    initialSettings,
     "managed_warehouse",
   );
 
@@ -1199,51 +1200,4 @@ export async function postRecreateManagedWarehouse(
   res.status(200).json({
     status: 200,
   });
-}
-
-/**
- * On Managed Warehouse creation, seed any default attributes that the org
- * doesn't already have so newly-created warehouses ship with sensible
- * identifier + dimension defaults. Existing attributes (including ones with
- * different datatypes or hashAttribute settings) are left untouched.
- */
-async function seedDefaultManagedWarehouseAttributes(
-  context: ReturnType<typeof getContextFromReq>,
-): Promise<void> {
-  const { org } = context;
-  const existing = org.settings?.attributeSchema || [];
-  const existingByProperty = new Map(existing.map((a) => [a.property, a]));
-
-  const defaultAttributes: SDKAttribute[] = [
-    // Identifier
-    { property: "device_id", datatype: "string", hashAttribute: true },
-    // Dimensions
-    { property: "geo_country", datatype: "string" },
-    { property: "ua_browser", datatype: "string" },
-    { property: "ua_os", datatype: "string" },
-    { property: "ua_device_type", datatype: "string" },
-    { property: "utm_source", datatype: "string" },
-    { property: "utm_medium", datatype: "string" },
-    { property: "utm_campaign", datatype: "string" },
-    { property: "url_path", datatype: "string" },
-  ];
-
-  const toAdd = defaultAttributes.filter(
-    (a) => !existingByProperty.has(a.property),
-  );
-  if (toAdd.length === 0) return;
-
-  await updateOrganization(org.id, {
-    settings: {
-      ...org.settings,
-      attributeSchema: [...existing, ...toAdd],
-    },
-  });
-
-  // Refresh the in-memory copy so callers working off `context.org.settings`
-  // see the newly-added attributes.
-  context.org.settings = {
-    ...context.org.settings,
-    attributeSchema: [...existing, ...toAdd],
-  };
 }
