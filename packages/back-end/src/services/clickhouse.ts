@@ -9,9 +9,14 @@ import {
   DataSourceParams,
   MaterializedColumn,
 } from "shared/types/datasource";
-import { DailyUsage } from "shared/types/organization";
+import { DailyUsage, SDKAttribute } from "shared/types/organization";
+import {
+  computeMaterializedColumnDiff,
+  deriveMaterializedColumnsFromAttributes,
+  parseIntWithDefault,
+  planManagedWarehouseAttributeMigration,
+} from "shared/util";
 import { FactTableColumnType } from "shared/types/fact-table";
-import { parseIntWithDefault } from "shared/util";
 import {
   CLICKHOUSE_HOST,
   CLICKHOUSE_ADMIN_USER,
@@ -30,16 +35,21 @@ import {
   updateFactTableColumns,
 } from "back-end/src/models/FactTableModel";
 import {
+  getDataSourcesByOrganization,
   lockDataSource,
   unlockDataSource,
+  updateDataSource,
 } from "back-end/src/models/DataSourceModel";
+import { updateOrganization } from "back-end/src/models/OrganizationModel";
 
 type ClickHouseDataType =
   | "DateTime"
   | "Float64"
   | "Boolean"
   | "String"
-  | "LowCardinality(String)";
+  | "LowCardinality(String)"
+  | "Array(String)"
+  | "Array(Float64)";
 
 // These will eventually move to be inside of attributes
 const tempTopLevelFields: Record<string, ClickHouseDataType> = {
@@ -118,7 +128,10 @@ function createAdminClickhouseClient() {
 
 function getClickhouseDatatype(
   columnType: FactTableColumnType,
+  arrayElementType?: "string" | "number",
 ): ClickHouseDataType {
+  if (arrayElementType === "string") return "Array(String)";
+  if (arrayElementType === "number") return "Array(Float64)";
   switch (columnType) {
     case "date":
       return "DateTime";
@@ -134,7 +147,15 @@ function getClickhouseDatatype(
 function getClickhouseExtractClause(
   sourceField: string,
   columnType: FactTableColumnType,
+  arrayElementType?: "string" | "number",
 ) {
+  // Array extraction always goes through context_json — top-level fields are
+  // never array-typed today.
+  if (arrayElementType) {
+    const chType = getClickhouseDatatype(columnType, arrayElementType);
+    return `JSONExtract(context_json, '${sourceField}', '${chType}')`;
+  }
+
   // Some fields will eventually be inside attributes instead of top-level
   // This is a temp workaround until then
   if (tempTopLevelFields[sourceField]) {
@@ -202,11 +223,17 @@ function getRemainingColumnDefs(): ColumnDef[] {
 function getMaterializedColumnDefs(
   materializedColumns: MaterializedColumn[],
 ): ColumnDef[] {
-  return materializedColumns.map(({ columnName, datatype, sourceField }) => ({
-    source: getClickhouseExtractClause(sourceField, datatype),
-    alias: columnName,
-    datatype: getClickhouseDatatype(datatype),
-  }));
+  return materializedColumns.map(
+    ({ columnName, datatype, sourceField, arrayElementType }) => ({
+      source: getClickhouseExtractClause(
+        sourceField,
+        datatype,
+        arrayElementType,
+      ),
+      alias: columnName,
+      datatype: getClickhouseDatatype(datatype, arrayElementType),
+    }),
+  );
 }
 
 function getMaterializedViewSQL({
@@ -461,6 +488,10 @@ export async function _dangerousRecreateClickhouseTables(
   context: ReqContext,
   datasource: GrowthbookClickhouseDataSource,
 ): Promise<void> {
+  // If this datasource is still in the legacy representation, migrate first
+  // so the recreated tables match the attributeSchema source of truth.
+  await ensureManagedWarehouseAttributesMigrated(context);
+
   const client = createAdminClickhouseClient();
 
   const orgId = context.org.id;
@@ -481,7 +512,9 @@ export async function _dangerousRecreateClickhouseTables(
     await createClickhouseTables(
       client,
       orgId,
-      datasource.settings.materializedColumns || [],
+      deriveMaterializedColumnsFromAttributes(
+        context.org.settings?.attributeSchema || [],
+      ),
     );
   } finally {
     await unlockDataSource(context, datasource);
@@ -703,9 +736,10 @@ export async function updateMaterializedColumns({
 
     const addClauses = columnsToAdd
       .map(
-        ({ columnName, datatype }) =>
+        ({ columnName, datatype, arrayElementType }) =>
           `ADD COLUMN IF NOT EXISTS ${columnName} ${getClickhouseDatatype(
             datatype,
+            arrayElementType,
           )}`,
       )
       .join(", ");
@@ -851,4 +885,202 @@ export async function updateMaterializedColumns({
   } finally {
     await unlockDataSource(context, datasource);
   }
+}
+
+/**
+ * Derive the portion of a Managed Warehouse datasource's settings that is
+ * fully determined by the org's attributeSchema: the list of identifier user
+ * id types and the default exposure queries (one per identifier).
+ */
+export function getManagedWarehouseDerivedSettings(
+  materializedColumns: MaterializedColumn[],
+): {
+  userIdTypes: NonNullable<
+    GrowthbookClickhouseDataSource["settings"]["userIdTypes"]
+  >;
+  exposureQueries: NonNullable<
+    NonNullable<
+      GrowthbookClickhouseDataSource["settings"]["queries"]
+    >["exposure"]
+  >;
+} {
+  const userIdTypes = materializedColumns
+    .filter((c) => c.type === "identifier")
+    .map((c) => ({
+      userIdType: c.columnName,
+      description: "",
+    }));
+
+  const identifiers = materializedColumns
+    .filter((c) => c.type === "identifier")
+    .map((c) => c.columnName);
+
+  const dimensions = materializedColumns
+    .filter((c) => c.type === "dimension")
+    .map((c) => c.columnName);
+
+  const exposureQueries = identifiers.map((identifier) => ({
+    id: identifier,
+    dimensions,
+    name: identifier,
+    userIdType: identifier,
+    query: `
+SELECT *
+FROM experiment_views
+WHERE
+  experiment_id LIKE '{{ experimentId }}'
+  AND timestamp BETWEEN '{{startDate}}' AND '{{endDate}}'`.trim(),
+  }));
+
+  return { userIdTypes, exposureQueries };
+}
+
+async function findManagedWarehouseDatasource(
+  context: ReqContext,
+): Promise<GrowthbookClickhouseDataSource | null> {
+  const datasources = await getDataSourcesByOrganization(context);
+  const match = datasources.find((d) => d.type === "growthbook_clickhouse");
+  return (match as GrowthbookClickhouseDataSource) || null;
+}
+
+/**
+ * Lazily migrate a Managed Warehouse datasource away from its legacy
+ * `settings.materializedColumns` representation:
+ *   - Any legacy column without a matching attribute is backfilled onto
+ *     `org.settings.attributeSchema` (`hashAttribute: true` when it was an
+ *     identifier). Existing attributes are left alone.
+ *   - `datasource.settings.materializedColumns` is cleared.
+ *
+ * Idempotent. Returns the set of attribute properties that were added so
+ * callers can merge them into any in-flight updates to attributeSchema.
+ * No-op when the org has no Managed Warehouse datasource or the datasource
+ * is already migrated.
+ *
+ * The context's `org.settings` is mutated in place so subsequent reads in
+ * the same request see the backfilled schema.
+ */
+export async function ensureManagedWarehouseAttributesMigrated(
+  context: ReqContext,
+): Promise<{ addedProperties: Set<string> }> {
+  const datasource = await findManagedWarehouseDatasource(context);
+  if (!datasource) return { addedProperties: new Set() };
+
+  const legacyColumns = datasource.settings.materializedColumns;
+  if (!legacyColumns || legacyColumns.length === 0) {
+    return { addedProperties: new Set() };
+  }
+
+  const existingAttributes = context.org.settings?.attributeSchema || [];
+  const { additions, skipped } = planManagedWarehouseAttributeMigration({
+    legacyColumns,
+    existingAttributes,
+  });
+
+  if (skipped.length > 0) {
+    logger.warn(
+      {
+        orgId: context.org.id,
+        skipped,
+      },
+      "Skipped legacy Managed Warehouse columns with unmappable datatypes during attributeSchema backfill",
+    );
+  }
+
+  const mergedSchema: SDKAttribute[] =
+    additions.length > 0
+      ? [...existingAttributes, ...additions]
+      : existingAttributes;
+
+  if (additions.length > 0) {
+    await updateOrganization(context.org.id, {
+      settings: {
+        ...context.org.settings,
+        attributeSchema: mergedSchema,
+      },
+    });
+    // Keep the in-memory context in sync so the caller's subsequent reads
+    // of org.settings.attributeSchema see the backfilled entries.
+    context.org.settings = {
+      ...context.org.settings,
+      attributeSchema: mergedSchema,
+    };
+  }
+
+  // Clear the legacy field regardless of whether we added attributes — the
+  // datasource is now considered migrated even if every column already had
+  // a matching attribute.
+  const { materializedColumns: _legacy, ...restSettings } = datasource.settings;
+  await updateDataSource(context, datasource, { settings: restSettings });
+
+  if (additions.length > 0) {
+    logger.info(
+      {
+        orgId: context.org.id,
+        migratedProperties: additions.map((a) => a.property),
+      },
+      "Backfilled Managed Warehouse attributes from legacy materializedColumns",
+    );
+  }
+
+  return { addedProperties: new Set(additions.map((a) => a.property)) };
+}
+
+/**
+ * Keep the Managed Warehouse datasource in sync with an attributeSchema change.
+ * - runs ALTER TABLE / view recreation to match the new attribute list
+ * - refreshes derived userIdTypes + exposure queries on the datasource
+ * No-op when the organization doesn't have a Managed Warehouse datasource.
+ */
+export async function syncManagedWarehouseAttributes(
+  context: ReqContext,
+  {
+    before,
+    after,
+    renames = [],
+  }: {
+    before: SDKAttribute[];
+    after: SDKAttribute[];
+    renames?: { from: string; to: string }[];
+  },
+): Promise<void> {
+  const datasource = await findManagedWarehouseDatasource(context);
+  if (!datasource) return;
+
+  const diff = computeMaterializedColumnDiff({ before, after, renames });
+
+  const hasDDLWork =
+    diff.columnsToAdd.length > 0 ||
+    diff.columnsToDelete.length > 0 ||
+    diff.columnsToRename.length > 0;
+
+  if (hasDDLWork) {
+    await updateMaterializedColumns({
+      context,
+      datasource,
+      columnsToAdd: diff.columnsToAdd,
+      columnsToDelete: diff.columnsToDelete,
+      columnsToRename: diff.columnsToRename,
+      finalColumns: diff.finalColumns,
+      originalColumns: diff.originalColumns,
+    });
+  }
+
+  // Always refresh the derived settings — even when the DDL didn't change,
+  // hashAttribute flips (dimension <-> identifier) still need to propagate
+  // into userIdTypes and the auto-generated exposure queries.
+  const { userIdTypes, exposureQueries } = getManagedWarehouseDerivedSettings(
+    diff.finalColumns,
+  );
+
+  await updateDataSource(context, datasource, {
+    dateUpdated: new Date(),
+    settings: {
+      ...datasource.settings,
+      userIdTypes,
+      queries: {
+        ...datasource.settings.queries,
+        exposure: exposureQueries,
+      },
+    },
+  });
 }

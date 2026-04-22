@@ -98,6 +98,7 @@ import {
   activateRoleById,
   addGetStartedChecklistItem,
 } from "back-end/src/models/OrganizationModel";
+import { updateAttributeSchema } from "back-end/src/services/attributes";
 import { ConfigFile } from "back-end/src/init/config";
 import { usingOpenId } from "back-end/src/services/auth";
 import { getSSOConnectionSummary } from "back-end/src/models/SSOConnectionModel";
@@ -1684,7 +1685,9 @@ export const autoAddGroupsAttribute = async (
 
     added = true;
 
-    await updateOrganization(org.id, updates);
+    await updateAttributeSchema(context, {
+      nextAttributeSchema: newAttributeSchema,
+    });
 
     await req.audit({
       event: "organization.update",

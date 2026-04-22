@@ -241,6 +241,9 @@ export type MaterializedColumn = {
   sourceField: string;
   datatype: FactTableColumnType;
   type?: MaterializedColumnType;
+  // Present when the column is an array; the scalar element type
+  // (mapped from attributes with datatype `string[]`/`number[]`/`secureString[]`).
+  arrayElementType?: "string" | "number";
 };
 
 export type DataSourceSettings = {

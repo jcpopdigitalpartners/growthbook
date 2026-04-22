@@ -44,6 +44,12 @@ jest.mock("back-end/src/models/FactTableModel", () => ({
 jest.mock("back-end/src/models/DataSourceModel", () => ({
   lockDataSource: jest.fn(),
   unlockDataSource: jest.fn(),
+  getDataSourcesByOrganization: jest.fn().mockResolvedValue([]),
+  updateDataSource: jest.fn(),
+}));
+
+jest.mock("back-end/src/models/OrganizationModel", () => ({
+  updateOrganization: jest.fn(),
 }));
 
 const mockGetFactTablesForDatasource = jest.mocked(getFactTablesForDatasource);
