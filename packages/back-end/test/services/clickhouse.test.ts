@@ -44,12 +44,12 @@ jest.mock("back-end/src/models/FactTableModel", () => ({
 jest.mock("back-end/src/models/DataSourceModel", () => ({
   lockDataSource: jest.fn(),
   unlockDataSource: jest.fn(),
-  getDataSourcesByOrganization: jest.fn().mockResolvedValue([]),
-  updateDataSource: jest.fn(),
 }));
 
-jest.mock("back-end/src/models/OrganizationModel", () => ({
-  updateOrganization: jest.fn(),
+// clickhouse.ts calls into clickhouseAttributes.ts only via
+// `_dangerousRecreateClickhouseTables`, which this suite doesn't exercise.
+jest.mock("back-end/src/services/clickhouseAttributes", () => ({
+  ensureManagedWarehouseAttributesMigrated: jest.fn().mockResolvedValue([]),
 }));
 
 const mockGetFactTablesForDatasource = jest.mocked(getFactTablesForDatasource);

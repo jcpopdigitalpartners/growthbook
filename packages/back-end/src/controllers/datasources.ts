@@ -70,8 +70,8 @@ import { IS_CLOUD } from "back-end/src/util/secrets";
 import {
   _dangerousRecreateClickhouseTables,
   createClickhouseUser,
-  getManagedWarehouseDerivedSettings,
 } from "back-end/src/services/clickhouse";
+import { getManagedWarehouseDerivedSettings } from "back-end/src/services/clickhouseAttributes";
 import { updateOrganization } from "back-end/src/models/OrganizationModel";
 import { UNITS_TABLE_PREFIX } from "back-end/src/queryRunners/ExperimentResultsQueryRunner";
 import { getExperimentsByTrackingKeys } from "back-end/src/models/ExperimentModel";

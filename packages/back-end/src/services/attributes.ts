@@ -3,7 +3,7 @@ import { updateOrganization } from "back-end/src/models/OrganizationModel";
 import {
   ensureManagedWarehouseAttributesMigrated,
   syncManagedWarehouseAttributes,
-} from "back-end/src/services/clickhouse";
+} from "back-end/src/services/clickhouseAttributes";
 import { logger } from "back-end/src/util/logger";
 import { ReqContext } from "back-end/types/request";
 
@@ -53,44 +53,32 @@ export async function updateAttributeSchema(
   // `nextAttributeSchema` against the pre-migration state, so any attributes
   // that the migration just backfilled would otherwise be dropped from the
   // org. Merge them in — caller's version wins for overlapping properties.
-  const { addedProperties: migratedAdditions } =
+  const migratedAdditions =
     await ensureManagedWarehouseAttributesMigrated(context);
-
-  const migratedSchema = org.settings?.attributeSchema || [];
-
-  if (migratedAdditions.size > 0) {
-    const nextByProperty = new Set(nextAttributeSchema.map((a) => a.property));
-    const toAppend = migratedSchema.filter(
-      (a) =>
-        migratedAdditions.has(a.property) && !nextByProperty.has(a.property),
-    );
-    if (toAppend.length > 0) {
-      nextAttributeSchema = [...nextAttributeSchema, ...toAppend];
-    }
+  if (migratedAdditions.length > 0) {
+    const nextProperties = new Set(nextAttributeSchema.map((a) => a.property));
+    nextAttributeSchema = [
+      ...nextAttributeSchema,
+      ...migratedAdditions.filter((a) => !nextProperties.has(a.property)),
+    ];
   }
 
-  const rollbackAttributeSchema = migratedSchema;
+  const previousAttributeSchema = org.settings?.attributeSchema || [];
 
   await updateOrganization(org.id, {
-    settings: {
-      ...org.settings,
-      attributeSchema: nextAttributeSchema,
-    },
+    settings: { ...org.settings, attributeSchema: nextAttributeSchema },
   });
 
   try {
     await syncManagedWarehouseAttributes(context, {
-      before: migratedSchema,
+      before: previousAttributeSchema,
       after: nextAttributeSchema,
       renames,
     });
   } catch (e) {
     try {
       await updateOrganization(org.id, {
-        settings: {
-          ...org.settings,
-          attributeSchema: rollbackAttributeSchema,
-        },
+        settings: { ...org.settings, attributeSchema: previousAttributeSchema },
       });
     } catch (rollbackError) {
       logger.error(
