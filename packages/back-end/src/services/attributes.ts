@@ -106,6 +106,27 @@ export async function updateAttributeSchema(
         renames,
       });
     } catch (e) {
+      // If the sync threw after DDL ran but before the snapshot write landed,
+      // ClickHouse is now ahead of the snapshot. Rollback reverts attributeSchema,
+      // so the next sync sees `originalColumns == finalColumns` and is a no-op —
+      // the extra CH columns become orphans that no future sync will diff away.
+      // Expected to be rare (requires post-DDL Mongo failure inside the sync);
+      // log with enough context that Sentry surfacing lets us reconcile by hand.
+      logger.error(
+        {
+          err: e,
+          orgId: org.id,
+          datasourceId: managedWarehouse.id,
+          attemptedAttributeProperties: newAttributeSchema.map(
+            (a) => a.property,
+          ),
+          rolledBackToAttributeProperties: previousAttributeSchema.map(
+            (a) => a.property,
+          ),
+          renames,
+        },
+        "Managed Warehouse sync failed; rolling back attributeSchema. ClickHouse may be ahead of the snapshot — inspect manually if orphan columns are suspected.",
+      );
       await rollbackAttributeSchema(context, previousAttributeSchema);
       throw e;
     }

@@ -248,10 +248,10 @@ export async function syncManagedWarehouseAttributes(
     // Re-fetch after acquiring the lock so we read the freshest snapshot. Any
     // concurrent writer that finished before us is now visible, and anyone who
     // starts after us will wait on the lock.
-    const refreshedDatasource = await getGrowthbookDatasource(context);
-    if (!refreshedDatasource) return;
+    const freshDatasource = await getGrowthbookDatasource(context);
+    if (!freshDatasource) return;
 
-    await runManagedWarehouseSync(context, refreshedDatasource, {
+    await runManagedWarehouseSync(context, freshDatasource, {
       attributeSchema,
       renames,
     });

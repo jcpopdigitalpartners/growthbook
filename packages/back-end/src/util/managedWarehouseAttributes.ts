@@ -250,6 +250,15 @@ export function computeMaterializedColumnDiff({
       // ClickHouse creates the new column with the correct datatype.
       continue;
     }
+    if (originalByName.has(to)) {
+      // Destination name is already in use by a different existing column.
+      // Shouldn't happen if upstream enforces attribute-property uniqueness,
+      // but guard so we don't silently drop the existing column from the
+      // diff and strand it in ClickHouse.
+      throw new Error(
+        `Cannot rename Managed Warehouse column "${from}" to "${to}" — a column named "${to}" already exists.`,
+      );
+    }
     originalByName.delete(from);
     originalByName.set(to, {
       ...prev,
@@ -381,9 +390,14 @@ export const MANAGED_WAREHOUSE_SQL_KEYWORD_BLOCKLIST: ReadonlySet<string> =
  * a Managed Warehouse datasource. Returns `undefined` when valid, or a
  * human-readable error message describing the problem.
  */
+const MANAGED_WAREHOUSE_COLUMN_NAME_MAX_LENGTH = 128;
+
 export function validateManagedWarehouseColumnName(
   name: string,
 ): string | undefined {
+  if (name.length > MANAGED_WAREHOUSE_COLUMN_NAME_MAX_LENGTH) {
+    return `Attribute name "${name}" is too long for a Managed Warehouse column (max ${MANAGED_WAREHOUSE_COLUMN_NAME_MAX_LENGTH} characters).`;
+  }
   if (!CLICKHOUSE_IDENTIFIER_REGEX.test(name)) {
     return `Attribute name "${name}" can't be used as a Managed Warehouse column — names must start with a letter or underscore and contain only alphanumerics and underscores.`;
   }

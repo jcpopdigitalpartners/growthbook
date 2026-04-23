@@ -438,31 +438,33 @@ export async function createClickhouseTables(
 
 export async function dangerousRecreateClickhouseTables(
   context: ReqContext,
+  datasource: GrowthbookClickhouseDataSource,
 ): Promise<void> {
-  // If this datasource is still in the legacy representation, migrate first
-  // so the recreated tables match the attributeSchema source of truth.
-  await ensureManagedWarehouseAttributesMigrated(context);
-
-  // Re-fetch after migration: the in-memory `datasource` parameter is stale
-  // (migration updates the DB but not this copy), and we need the freshly-
-  // seeded `syncedMaterializedColumns` snapshot for override extraction.
-  const freshDatasource = (await getGrowthbookDatasource(
-    context,
-  )) as GrowthbookClickhouseDataSource | null;
-  if (!freshDatasource) {
-    throw new Error("Managed Warehouse datasource disappeared during recreate");
-  }
-
   const client = createAdminClickhouseClient();
 
   const orgId = context.org.id;
   const user = clickhouseUserId(orgId);
   const database = user;
 
-  // Backfilling data can take a while, so lock the datasource for 30 minutes
-  await lockDataSource(context, freshDatasource, 1800);
+  // Backfilling data can take a while, so lock the datasource for 30 minutes.
+  // Lock before migrating so a concurrent attribute-sync can't interleave
+  // between migration's snapshot seed and our recreate acquiring the lock.
+  await lockDataSource(context, datasource, 1800);
 
   try {
+    // If this datasource is still in the legacy representation, migrate first
+    // so the recreated tables match the attributeSchema source of truth.
+    await ensureManagedWarehouseAttributesMigrated(context);
+
+    // Re-fetch after migration: `datasource` is stale (migration
+    // updates the DB but not this copy), and we need the freshly-seeded
+    // `syncedMaterializedColumns` snapshot for override extraction.
+    const freshDatasource = await getGrowthbookDatasource(context);
+    if (!freshDatasource) {
+      throw new Error(
+        "Managed Warehouse datasource disappeared during recreate",
+      );
+    }
     // Drop the entire database and recreate it
     logger.info(`Dropping Clickhouse database ${database}`);
     await runCommand(client, `DROP DATABASE IF EXISTS ${database}`);
@@ -504,7 +506,7 @@ export async function dangerousRecreateClickhouseTables(
       },
     });
   } finally {
-    await unlockDataSource(context, freshDatasource);
+    await unlockDataSource(context, datasource);
   }
 }
 

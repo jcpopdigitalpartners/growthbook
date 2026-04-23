@@ -1197,7 +1197,7 @@ export async function postRecreateManagedWarehouse(
     );
   }
 
-  await dangerousRecreateClickhouseTables(context);
+  await dangerousRecreateClickhouseTables(context, datasource);
 
   res.status(200).json({
     status: 200,
