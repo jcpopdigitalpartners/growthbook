@@ -5,7 +5,7 @@ import {
 } from "shared/types/datasource";
 import { MANAGED_WAREHOUSE_EVENTS_FACT_TABLE_ID } from "shared/constants";
 import type { ReqContext } from "back-end/types/request";
-import { _updateMaterializedColumnsUnsafe } from "back-end/src/services/clickhouse";
+import { dangerousUpdateMaterializedColumns } from "back-end/src/services/clickhouse";
 import {
   getFactTablesForDatasource,
   updateFactTableColumns,
@@ -47,7 +47,7 @@ jest.mock("back-end/src/models/DataSourceModel", () => ({
 }));
 
 // clickhouse.ts calls into clickhouseAttributes.ts only via
-// `_dangerousRecreateClickhouseTables`, which this suite doesn't exercise.
+// `dangerousRecreateClickhouseTables`, which this suite doesn't exercise.
 jest.mock("back-end/src/services/clickhouseAttributes", () => ({
   ensureManagedWarehouseAttributesMigrated: jest.fn().mockResolvedValue([]),
 }));
@@ -82,7 +82,7 @@ function makeFactTable(columns: ColumnInterface[]): FactTableInterface {
   } as unknown as FactTableInterface;
 }
 
-describe("_updateMaterializedColumnsUnsafe", () => {
+describe("dangerousUpdateMaterializedColumns", () => {
   const context = {
     org: { id: "org_test" },
   } as unknown as ReqContext;
@@ -119,7 +119,7 @@ describe("_updateMaterializedColumnsUnsafe", () => {
       },
     ];
 
-    await _updateMaterializedColumnsUnsafe({
+    await dangerousUpdateMaterializedColumns({
       context,
       datasource,
       columnsToAdd: finalColumns,
@@ -158,7 +158,7 @@ describe("_updateMaterializedColumnsUnsafe", () => {
       },
     ];
 
-    await _updateMaterializedColumnsUnsafe({
+    await dangerousUpdateMaterializedColumns({
       context,
       datasource,
       columnsToAdd: [],

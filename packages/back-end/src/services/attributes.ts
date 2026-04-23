@@ -108,22 +108,37 @@ export async function updateAttributeSchema(
       renames,
     });
   } catch (e) {
-    try {
-      // `previousAttributeSchema` is the post-migration schema (read after
-      // `ensureManagedWarehouseAttributesMigrated` ran), not the true
-      // pre-request state. That's intentional: the migration is one-way and
-      // idempotent, and a subsequent attribute write against the backfilled
-      // schema is a no-op diff. We're rolling the user's requested edit back,
-      // not the migration.
-      await updateOrganization(org.id, {
-        settings: { ...org.settings, attributeSchema: previousAttributeSchema },
-      });
-    } catch (rollbackError) {
-      logger.error(
-        rollbackError,
-        "Failed to roll back attributeSchema after Managed Warehouse sync failure",
-      );
-    }
+    await rollbackAttributeSchema(context, previousAttributeSchema);
     throw e;
+  }
+}
+
+/**
+ * Restore the org's attributeSchema to its pre-edit value after a failed
+ * Managed Warehouse sync, so callers don't end up with attributes that have
+ * no backing column.
+ *
+ * `previousAttributeSchema` is the post-migration schema (read after
+ * `ensureManagedWarehouseAttributesMigrated` ran), not the true pre-request
+ * state. That's intentional: the migration is one-way and idempotent, and a
+ * subsequent attribute write against the backfilled schema is a no-op diff.
+ * We're rolling the user's requested edit back, not the migration.
+ */
+async function rollbackAttributeSchema(
+  context: ReqContext,
+  previousAttributeSchema: SDKAttribute[],
+): Promise<void> {
+  try {
+    await updateOrganization(context.org.id, {
+      settings: {
+        ...context.org.settings,
+        attributeSchema: previousAttributeSchema,
+      },
+    });
+  } catch (rollbackError) {
+    logger.error(
+      rollbackError,
+      "Failed to roll back attributeSchema after Managed Warehouse sync failure",
+    );
   }
 }

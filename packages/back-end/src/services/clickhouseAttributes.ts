@@ -19,7 +19,7 @@ import {
 } from "back-end/src/models/DataSourceModel";
 import { updateOrganization } from "back-end/src/models/OrganizationModel";
 import {
-  _updateMaterializedColumnsUnsafe,
+  dangerousUpdateMaterializedColumns,
   getReservedColumnNames,
   WAREHOUSE_BUILTIN_COLUMN_NAMES,
   WAREHOUSE_BUILTIN_COLUMNS,
@@ -95,6 +95,19 @@ export function extractColumnNameOverrides(
   return overrides;
 }
 
+type ManagedWarehouseSettings = GrowthbookClickhouseDataSource["settings"];
+type UserIdType = NonNullable<ManagedWarehouseSettings["userIdTypes"]>[number];
+type ExposureQuery = NonNullable<
+  NonNullable<ManagedWarehouseSettings["queries"]>["exposure"]
+>[number];
+
+const DEFAULT_EXPOSURE_QUERY_SQL = `
+SELECT *
+FROM experiment_views
+WHERE
+  experiment_id LIKE '{{ experimentId }}'
+  AND timestamp BETWEEN '{{startDate}}' AND '{{endDate}}'`.trim();
+
 /**
  * Derive the portion of a Managed Warehouse datasource's settings that is
  * fully determined by the org's attributeSchema: the list of identifier user
@@ -103,14 +116,8 @@ export function extractColumnNameOverrides(
 export function getManagedWarehouseDerivedSettings(
   materializedColumns: MaterializedColumn[],
 ): {
-  userIdTypes: NonNullable<
-    GrowthbookClickhouseDataSource["settings"]["userIdTypes"]
-  >;
-  exposureQueries: NonNullable<
-    NonNullable<
-      GrowthbookClickhouseDataSource["settings"]["queries"]
-    >["exposure"]
-  >;
+  userIdTypes: UserIdType[];
+  exposureQueries: ExposureQuery[];
 } {
   const identifierColumns = materializedColumns.filter(
     (c) => c.type === "identifier",
@@ -119,22 +126,17 @@ export function getManagedWarehouseDerivedSettings(
     .filter((c) => c.type === "dimension")
     .map((c) => c.columnName);
 
-  const userIdTypes = identifierColumns.map((c) => ({
+  const userIdTypes: UserIdType[] = identifierColumns.map((c) => ({
     userIdType: c.columnName,
     description: "",
   }));
 
-  const exposureQueries = identifierColumns.map((c) => ({
+  const exposureQueries: ExposureQuery[] = identifierColumns.map((c) => ({
     id: c.columnName,
     dimensions,
     name: c.columnName,
     userIdType: c.columnName,
-    query: `
-SELECT *
-FROM experiment_views
-WHERE
-  experiment_id LIKE '{{ experimentId }}'
-  AND timestamp BETWEEN '{{startDate}}' AND '{{endDate}}'`.trim(),
+    query: DEFAULT_EXPOSURE_QUERY_SQL,
   }));
 
   return { userIdTypes, exposureQueries };
@@ -273,44 +275,55 @@ export async function syncManagedWarehouseAttributes(
   }
 }
 
-async function runManagedWarehouseSync(
-  context: ReqContext,
-  datasource: GrowthbookClickhouseDataSource,
-  {
-    attributeSchema,
-    renames,
-  }: {
-    attributeSchema: SDKAttribute[];
-    renames: { from: string; to: string }[];
-  },
-): Promise<void> {
-  const originalColumns = datasource.settings.syncedMaterializedColumns || [];
+function getIdentifierNames(columns: MaterializedColumn[]): Set<string> {
+  return new Set(
+    columns.filter((c) => c.type === "identifier").map((c) => c.columnName),
+  );
+}
+
+function setsEqual<T>(a: ReadonlySet<T>, b: ReadonlySet<T>): boolean {
+  if (a.size !== b.size) return false;
+  for (const v of a) if (!b.has(v)) return false;
+  return true;
+}
+
+/**
+ * Compute the target column set the warehouse should contain given the
+ * attribute schema and what's currently synced, and derive any column-level
+ * work needed to get there.
+ *
+ * Throws if an incoming attribute collides with a legacy pass-through column
+ * (datatype date/json/other/"") — the user has no UI surface for the
+ * pass-through so they'd otherwise hit an opaque datatype-change error
+ * downstream.
+ */
+function computeSyncPlan(
+  orgId: string,
+  originalColumns: MaterializedColumn[],
+  attributeSchema: SDKAttribute[],
+  renames: { from: string; to: string }[],
+) {
   // Pre-refactor orgs may have columns whose ClickHouse name differs from the
   // attribute's sourceField. Preserve that mapping from the snapshot so we
   // don't drop-and-recreate otherwise-identical columns.
   const columnNameOverrides = extractColumnNameOverrides(originalColumns);
-  const attributeAndBuiltinColumns = getWarehouseMaterializedColumns(
-    attributeSchema,
-    { columnNameOverrides, orgId: context.org.id },
-  );
+  const managedColumns = getWarehouseMaterializedColumns(attributeSchema, {
+    columnNameOverrides,
+    orgId,
+  });
+  const managedColumnNames = new Set(managedColumns.map((c) => c.columnName));
+
   // Pre-refactor warehouses could contain columns with datatypes the new
-  // attribute flow can't express (date / json / other / ""). The migration
-  // skips backfilling them as attributes, but their snapshot entry is still
-  // in `originalColumns`. Append them to `finalColumns` so the diff treats
-  // them as unchanged instead of silently dropping them.
-  const knownColumnNames = new Set(
-    attributeAndBuiltinColumns.map((c) => c.columnName),
-  );
+  // attribute flow can't express. The migration skips backfilling them as
+  // attributes, but their snapshot entry is still in `originalColumns`.
+  // Append them to `finalColumns` so the diff treats them as unchanged
+  // instead of silently dropping them.
   const passThroughColumns = originalColumns.filter(
-    (c) => isLegacyPassThroughColumn(c) && !knownColumnNames.has(c.columnName),
+    (c) =>
+      isLegacyPassThroughColumn(c) && !managedColumnNames.has(c.columnName),
   );
-  // Detect the narrow case where a new attribute's column name collides with a
-  // pre-existing legacy pass-through column (datatype date/json/other/""). The
-  // user has no UI surface for the pass-through column, so without a clear
-  // error they'd hit an opaque "Cannot change the datatype" from the diff step
-  // with no diagnostic path. Throw early with actionable guidance.
   const shadowedPassThroughs = originalColumns.filter(
-    (c) => isLegacyPassThroughColumn(c) && knownColumnNames.has(c.columnName),
+    (c) => isLegacyPassThroughColumn(c) && managedColumnNames.has(c.columnName),
   );
   if (shadowedPassThroughs.length > 0) {
     const names = shadowedPassThroughs.map((c) => c.columnName).join(", ");
@@ -318,60 +331,39 @@ async function runManagedWarehouseSync(
       `Cannot create attributes that collide with legacy Managed Warehouse columns: ${names}. These columns predate the attribute flow and can't be represented as attributes. Rename your attribute, or contact support to recreate the warehouse.`,
     );
   }
-  const finalColumns = [...attributeAndBuiltinColumns, ...passThroughColumns];
+
+  const finalColumns = [...managedColumns, ...passThroughColumns];
   const diff = computeMaterializedColumnDiff({
     originalColumns,
     finalColumns,
     renames,
   });
 
-  const hasDDLWork =
-    diff.columnsToAdd.length > 0 ||
+  // Regenerate derived `userIdTypes` + default `queries.exposure` only when the
+  // materialized-column set changed structurally: identifiers changed (added/
+  // removed/renamed, or `hashAttribute` flipped between identifier and
+  // dimension), OR any dimension was removed or renamed. Purely additive
+  // edits (new dimension attribute, description-only changes) leave any
+  // customer-edited exposure query or userIdTypes list alone.
+  const identifiersChanged = !setsEqual(
+    getIdentifierNames(originalColumns),
+    getIdentifierNames(finalColumns),
+  );
+  const shouldRegenerateDerivedSettings =
+    identifiersChanged ||
     diff.columnsToDelete.length > 0 ||
     diff.columnsToRename.length > 0;
 
-  if (hasDDLWork) {
-    await _updateMaterializedColumnsUnsafe({
-      context,
-      datasource,
-      columnsToAdd: diff.columnsToAdd,
-      columnsToDelete: diff.columnsToDelete,
-      columnsToRename: diff.columnsToRename,
-      finalColumns: diff.finalColumns,
-      originalColumns: diff.originalColumns,
-    });
-  }
+  return { diff, finalColumns, shouldRegenerateDerivedSettings };
+}
 
-  // Regenerate derived `userIdTypes` + default `queries.exposure` only when the
-  // materialized-column set changed structurally: identifier set changed
-  // (adds/removes, renames, or `hashAttribute` flips between identifier and
-  // dimension) OR any dimension was removed or renamed. Purely additive edits
-  // (new dimension attribute, description-only changes) don't regenerate — they
-  // leave any customer-edited exposure query or userIdTypes list alone.
-  //
-  // When we do regenerate we rebuild from defaults wholesale; this matches main's
-  // clobber-on-column-change behavior while narrowing the trigger so that the
-  // majority of attribute edits (most of which are additive or non-column) pass
-  // through untouched.
-  const prevIdentifiers = new Set(
-    originalColumns
-      .filter((c) => c.type === "identifier")
-      .map((c) => c.columnName),
-  );
-  const nextIdentifiers = new Set(
-    finalColumns
-      .filter((c) => c.type === "identifier")
-      .map((c) => c.columnName),
-  );
-  const identifierSetChanged =
-    prevIdentifiers.size !== nextIdentifiers.size ||
-    [...prevIdentifiers].some((id) => !nextIdentifiers.has(id));
-  const hasRemovalOrRename =
-    diff.columnsToDelete.length > 0 || diff.columnsToRename.length > 0;
-  const shouldRegenerateDerivedSettings =
-    identifierSetChanged || hasRemovalOrRename;
-
-  // Write the snapshot first, as a dedicated update. If this second write
+async function persistSyncResult(
+  context: ReqContext,
+  datasource: GrowthbookClickhouseDataSource,
+  finalColumns: MaterializedColumn[],
+  shouldRegenerateDerivedSettings: boolean,
+): Promise<void> {
+  // Write the snapshot first, as a dedicated update. If the second write
   // (derived settings) fails, the snapshot still accurately reflects CH state
   // and the next sync can compute a correct diff — without this split, a
   // failure between DDL success and the end of this function would leave the
@@ -385,20 +377,59 @@ async function runManagedWarehouseSync(
     },
   });
 
-  if (shouldRegenerateDerivedSettings) {
-    const { userIdTypes, exposureQueries } =
-      getManagedWarehouseDerivedSettings(finalColumns);
-    await updateDataSource(context, datasource, {
-      dateUpdated: new Date(),
-      settings: {
-        ...datasource.settings,
-        syncedMaterializedColumns: finalColumns,
-        userIdTypes,
-        queries: {
-          ...datasource.settings.queries,
-          exposure: exposureQueries,
-        },
+  if (!shouldRegenerateDerivedSettings) return;
+
+  const { userIdTypes, exposureQueries } =
+    getManagedWarehouseDerivedSettings(finalColumns);
+  await updateDataSource(context, datasource, {
+    dateUpdated: new Date(),
+    settings: {
+      ...datasource.settings,
+      syncedMaterializedColumns: finalColumns,
+      userIdTypes,
+      queries: {
+        ...datasource.settings.queries,
+        exposure: exposureQueries,
       },
+    },
+  });
+}
+
+async function runManagedWarehouseSync(
+  context: ReqContext,
+  datasource: GrowthbookClickhouseDataSource,
+  {
+    attributeSchema,
+    renames,
+  }: {
+    attributeSchema: SDKAttribute[];
+    renames: { from: string; to: string }[];
+  },
+): Promise<void> {
+  const originalColumns = datasource.settings.syncedMaterializedColumns || [];
+  const { diff, finalColumns, shouldRegenerateDerivedSettings } =
+    computeSyncPlan(context.org.id, originalColumns, attributeSchema, renames);
+
+  if (
+    diff.columnsToAdd.length > 0 ||
+    diff.columnsToDelete.length > 0 ||
+    diff.columnsToRename.length > 0
+  ) {
+    await dangerousUpdateMaterializedColumns({
+      context,
+      datasource,
+      columnsToAdd: diff.columnsToAdd,
+      columnsToDelete: diff.columnsToDelete,
+      columnsToRename: diff.columnsToRename,
+      finalColumns: diff.finalColumns,
+      originalColumns: diff.originalColumns,
     });
   }
+
+  await persistSyncResult(
+    context,
+    datasource,
+    finalColumns,
+    shouldRegenerateDerivedSettings,
+  );
 }

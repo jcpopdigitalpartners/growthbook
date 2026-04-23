@@ -6,10 +6,8 @@ import type { FactTableColumnType } from "../../types/fact-table";
  * Map an SDK attribute datatype to the MaterializedColumn representation the
  * ClickHouse service uses to generate DDL.
  *
- * Returns `undefined` for attributes that cannot be materialized (currently
- * there are none — every attribute datatype has a target — but the helper
- * stays defensive so new datatypes default to "skip" rather than silently
- * creating the wrong column type).
+ * Returns `undefined` as a defensive fallback so a newly added SDK datatype
+ * defaults to "skip" rather than silently creating the wrong column type.
  */
 export function materializedColumnTypeFromAttribute(
   datatype: SDKAttribute["datatype"],
@@ -90,9 +88,7 @@ export function deriveMaterializedColumnsFromAttributes(
       sourceField: attr.property,
       datatype: mapped.datatype,
       type: isIdentifier ? "identifier" : "dimension",
-      ...(mapped.arrayElementType
-        ? { arrayElementType: mapped.arrayElementType }
-        : {}),
+      arrayElementType: mapped.arrayElementType,
     });
   }
 
@@ -315,7 +311,9 @@ export function validateManagedWarehouseColumnName(
  */
 export function isLegacyPassThroughColumn(col: MaterializedColumn): boolean {
   if (col.arrayElementType) return false;
-  return legacyMaterializedColumnDatatypeToAttribute(col.datatype) === undefined;
+  return (
+    legacyMaterializedColumnDatatypeToAttribute(col.datatype) === undefined
+  );
 }
 
 /**

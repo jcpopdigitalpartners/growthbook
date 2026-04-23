@@ -67,7 +67,7 @@ import { SourceIntegrationInterface } from "back-end/src/types/Integration";
 import { logger } from "back-end/src/util/logger";
 import { IS_CLOUD } from "back-end/src/util/secrets";
 import {
-  _dangerousRecreateClickhouseTables,
+  dangerousRecreateClickhouseTables,
   createClickhouseUser,
 } from "back-end/src/services/clickhouse";
 import {
@@ -1197,7 +1197,7 @@ export async function postRecreateManagedWarehouse(
     );
   }
 
-  await _dangerousRecreateClickhouseTables(context);
+  await dangerousRecreateClickhouseTables(context);
 
   res.status(200).json({
     status: 200,

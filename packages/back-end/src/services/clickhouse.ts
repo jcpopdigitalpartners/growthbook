@@ -11,7 +11,10 @@ import {
 } from "shared/types/datasource";
 import { DailyUsage } from "shared/types/organization";
 import { parseIntWithDefault, isLegacyPassThroughColumn } from "shared/util";
-import { FactTableColumnType } from "shared/types/fact-table";
+import {
+  FactTableColumnType,
+  FactTableInterface,
+} from "shared/types/fact-table";
 import {
   CLICKHOUSE_HOST,
   CLICKHOUSE_ADMIN_USER,
@@ -50,14 +53,13 @@ type ClickHouseDataType =
   | "Array(String)"
   | "Array(Float64)";
 
-// These will eventually move to be inside of attributes
 // Columns the ingestor writes to the top-level of the `events` table. These
 // are either server-enriched (geo_*, ua_*, url_{path,host,query,fragment}) or
 // SDK-sent top-level fields (device_id, utm_*, url, …) — none of them live
 // inside `context_json`, so they aren't visible to the SDK at feature /
 // experiment assignment time. We materialize them for dimension analysis but
 // they are NOT part of the org's attributeSchema.
-const tempTopLevelFields: Record<string, ClickHouseDataType> = {
+const WAREHOUSE_BUILTIN_FIELD_TYPES: Record<string, ClickHouseDataType> = {
   user_id: "String",
   url: "String",
   url_path: "String",
@@ -109,7 +111,7 @@ function clickhouseTypeToFactTableType(
  * aren't available to the SDK at assignment time.
  */
 export const WAREHOUSE_BUILTIN_COLUMNS: MaterializedColumn[] = Object.entries(
-  tempTopLevelFields,
+  WAREHOUSE_BUILTIN_FIELD_TYPES,
 ).map(([name, type]) => ({
   columnName: name,
   sourceField: name,
@@ -199,13 +201,14 @@ function getClickhouseExtractClause(
     return `JSONExtract(context_json, '${sourceField}', '${chType}')`;
   }
 
-  // Some fields will eventually be inside attributes instead of top-level
-  // This is a temp workaround until then
-  if (tempTopLevelFields[sourceField]) {
+  // Warehouse built-ins live at the top level of the `events` table (populated
+  // by the ingestor), not inside `context_json`. Reference the column directly,
+  // casting only if the stored type differs from the requested fact-table type.
+  if (WAREHOUSE_BUILTIN_FIELD_TYPES[sourceField]) {
     const desiredDataType = getClickhouseDatatype(columnType);
 
     // If the desired data type is different from the actual type, need to cast it
-    if (desiredDataType !== tempTopLevelFields[sourceField]) {
+    if (desiredDataType !== WAREHOUSE_BUILTIN_FIELD_TYPES[sourceField]) {
       return `CAST(${sourceField} AS ${desiredDataType})`;
     }
 
@@ -223,19 +226,21 @@ function getClickhouseExtractClause(
   }
 }
 
-export function getReservedColumnNames(): Set<string> {
-  return new Set(
-    [
-      "timestamp",
-      "client_key",
-      "event_name",
-      "properties",
-      "attributes",
-      "experiment_id",
-      "variation_id",
-      ...Object.keys(REMAINING_COLUMNS_SCHEMA),
-    ].map((col) => col.toLowerCase()),
-  );
+const RESERVED_COLUMN_NAMES: ReadonlySet<string> = new Set(
+  [
+    "timestamp",
+    "client_key",
+    "event_name",
+    "properties",
+    "attributes",
+    "experiment_id",
+    "variation_id",
+    ...Object.keys(REMAINING_COLUMNS_SCHEMA),
+  ].map((col) => col.toLowerCase()),
+);
+
+export function getReservedColumnNames(): ReadonlySet<string> {
+  return RESERVED_COLUMN_NAMES;
 }
 
 type ColumnDef = {
@@ -527,7 +532,7 @@ export async function createClickhouseTables(
   await runCommand(client, `GRANT SELECT ON ${database}.* TO ${user}`);
 }
 
-export async function _dangerousRecreateClickhouseTables(
+export async function dangerousRecreateClickhouseTables(
   context: ReqContext,
 ): Promise<void> {
   // If this datasource is still in the legacy representation, migrate first
@@ -786,15 +791,118 @@ WITH FILL
   }));
 }
 
+type MaterializedViewBuilder = (
+  orgId: string,
+  columns: MaterializedColumn[],
+) => { tableName: string; viewName: string; createView: string };
+
+/**
+ * Apply an ALTER TABLE to a materialized view's underlying table. The view
+ * must be dropped before the ALTER and recreated after, whether or not the
+ * ALTER succeeds — otherwise queries against the view fail.
+ *
+ * We swallow the ALTER error and rethrow after the view is restored so the
+ * finally-block's own failures don't mask the real error. On ALTER failure
+ * the view is rebuilt against the original columns (unchanged CH schema);
+ * on success it's rebuilt against the new columns.
+ */
+async function alterTableAndRecreateView(
+  client: ReturnType<typeof createAdminClickhouseClient>,
+  orgId: string,
+  buildSQL: MaterializedViewBuilder,
+  clauses: string,
+  originalColumns: MaterializedColumn[],
+  finalColumns: MaterializedColumn[],
+) {
+  const { tableName, viewName } = buildSQL(orgId, []);
+  logger.info(`Updating materialized columns; dropping view ${viewName}`);
+  await runCommand(client, `DROP VIEW IF EXISTS ${viewName}`);
+
+  let viewColumns = originalColumns;
+  let alterError: unknown;
+  try {
+    logger.info(`Updating table schema for ${tableName}`);
+    await runCommand(client, `ALTER TABLE ${tableName} ${clauses}`);
+    viewColumns = finalColumns;
+  } catch (e) {
+    logger.error(e);
+    alterError = e;
+  } finally {
+    logger.info(`Recreating materialized view ${viewName}`);
+    await runCommand(client, buildSQL(orgId, viewColumns).createView);
+  }
+  if (alterError) throw alterError;
+}
+
+function applyColumnChangesToFactTable(
+  existingColumns: FactTableInterface["columns"],
+  columnsToAdd: MaterializedColumn[],
+  columnsToDelete: string[],
+  columnsToRename: { from: string; to: string }[],
+): FactTableInterface["columns"] {
+  const now = new Date();
+  const next = existingColumns.map((col) => ({
+    ...col,
+    numberFormat: col.numberFormat ?? "",
+  }));
+
+  for (const col of columnsToAdd) {
+    const existing = next.find((c) => c.column === col.columnName);
+    if (existing) {
+      // Restore a previously-removed column.
+      existing.deleted = false;
+      existing.dateUpdated = now;
+    } else {
+      next.push({
+        column: col.columnName,
+        name: col.columnName,
+        datatype: col.datatype,
+        dateCreated: now,
+        dateUpdated: now,
+        deleted: false,
+        description: "",
+        numberFormat: "",
+      });
+    }
+  }
+
+  for (const { from, to } of columnsToRename) {
+    const col = next.find((c) => c.column === from);
+    if (!col) continue;
+    const destination = next.find((c) => c.column === to);
+    if (destination) {
+      // Destination already exists — restore it and tombstone the source.
+      destination.deleted = false;
+      destination.dateUpdated = now;
+      col.deleted = true;
+      col.dateUpdated = now;
+    } else {
+      col.column = to;
+      col.name = to;
+      col.dateUpdated = now;
+    }
+  }
+
+  for (const name of columnsToDelete) {
+    const col = next.find((c) => c.column === name);
+    if (col) {
+      col.deleted = true;
+      col.dateUpdated = now;
+    }
+  }
+
+  return next;
+}
+
 /**
  * @internal — does NOT acquire the datasource lock. Callers are responsible for
  * holding the lock for the whole read-compute-write sequence
  * (`syncedMaterializedColumns` → diff → DDL → snapshot write). The only caller
  * today is `syncManagedWarehouseAttributes`, which locks around this. The
- * `_unsafe` prefix is a warning: adding a new caller without locking will
+ * `dangerous` prefix is a warning: adding a new caller without locking will
  * re-introduce the concurrent-write race this was designed around.
  */
-export async function _updateMaterializedColumnsUnsafe({
+export async function dangerousUpdateMaterializedColumns({
   context,
   datasource,
   columnsToAdd,
@@ -812,84 +920,39 @@ export async function _updateMaterializedColumnsUnsafe({
   originalColumns: MaterializedColumn[];
 }) {
   const client = createAdminClickhouseClient();
-
   const orgId = datasource.organization;
 
-  const addClauses = columnsToAdd
-    .map(
-      ({ columnName, datatype, arrayElementType }) =>
-        `ADD COLUMN IF NOT EXISTS ${columnName} ${getClickhouseDatatype(
-          datatype,
-          arrayElementType,
-        )}`,
-    )
-    .join(", ");
-  const dropClauses = columnsToDelete
-    .map((columnName) => `DROP COLUMN IF EXISTS ${columnName}`)
-    .join(", ");
-  const renameClauses = columnsToRename
-    .map(({ from, to }) => `RENAME COLUMN ${from} to ${to}`)
-    .join(", ");
-  const clauses = `${addClauses}${
-    columnsToAdd.length > 0 &&
-    columnsToDelete.length + columnsToRename.length > 0
-      ? ", "
-      : ""
-  }${dropClauses}${
-    columnsToDelete.length > 0 && columnsToRename.length > 0 ? ", " : ""
-  }${renameClauses}`;
+  const addClauses = columnsToAdd.map(
+    ({ columnName, datatype, arrayElementType }) =>
+      `ADD COLUMN IF NOT EXISTS ${columnName} ${getClickhouseDatatype(
+        datatype,
+        arrayElementType,
+      )}`,
+  );
+  const dropClauses = columnsToDelete.map(
+    (columnName) => `DROP COLUMN IF EXISTS ${columnName}`,
+  );
+  const renameClauses = columnsToRename.map(
+    ({ from, to }) => `RENAME COLUMN ${from} to ${to}`,
+  );
+  const clauses = [...addClauses, ...dropClauses, ...renameClauses].join(", ");
 
-  // Track which columns the view should be recreated with in case of an error
-  let viewColumns = originalColumns;
-
-  // First update the main events table
-  const { tableName: eventsTableName, viewName: eventsViewName } = getEventsSQL(
+  await alterTableAndRecreateView(
+    client,
     orgId,
-    [],
+    getEventsSQL,
+    clauses,
+    originalColumns,
+    finalColumns,
   );
-  logger.info(`Updating materialized columns; dropping view ${eventsViewName}`);
-  await runCommand(client, `DROP VIEW IF EXISTS ${eventsViewName}`);
-  let err = undefined;
-  try {
-    logger.info(`Updating table schema for ${eventsTableName}`);
-    await runCommand(client, `ALTER TABLE ${eventsTableName} ${clauses}`);
-    viewColumns = finalColumns;
-  } catch (e) {
-    logger.error(e);
-    err = e;
-  } finally {
-    logger.info(`Recreating materialized view ${eventsViewName}`);
-    const eventsSQL = getEventsSQL(orgId, viewColumns);
-    await runCommand(client, eventsSQL.createView);
-  }
-  if (err) {
-    throw err;
-  }
-
-  // Now update the experiment views table
-  const { tableName: exposureTableName, viewName: exposureViewName } =
-    getExperimentViewSQL(orgId, []);
-  logger.info(
-    `Updating materialized columns; dropping view ${exposureViewName}`,
+  await alterTableAndRecreateView(
+    client,
+    orgId,
+    getExperimentViewSQL,
+    clauses,
+    originalColumns,
+    finalColumns,
   );
-  await runCommand(client, `DROP VIEW IF EXISTS ${exposureViewName}`);
-  err = undefined;
-  viewColumns = originalColumns;
-  try {
-    logger.info(`Updating table schema for ${exposureTableName}`);
-    await runCommand(client, `ALTER TABLE ${exposureTableName} ${clauses}`);
-    viewColumns = finalColumns;
-  } catch (e) {
-    logger.error(e);
-    err = e;
-  } finally {
-    logger.info(`Recreating materialized view ${exposureViewName}`);
-    const experimentViewSQL = getExperimentViewSQL(orgId, viewColumns);
-    await runCommand(client, experimentViewSQL.createView);
-  }
-  if (err) {
-    throw err;
-  }
 
   // Update the main events fact table with the new columns
   const factTables = await getFactTablesForDatasource(context, datasource.id);
@@ -897,60 +960,12 @@ export async function _updateMaterializedColumnsUnsafe({
     (ft) => ft.id === MANAGED_WAREHOUSE_EVENTS_FACT_TABLE_ID,
   );
   if (ft) {
-    const newColumns = [...ft.columns];
-    newColumns.forEach((col) => {
-      if (col.numberFormat === undefined) {
-        col.numberFormat = "";
-      }
-    });
-
-    columnsToAdd.forEach((col) => {
-      const existingCol = newColumns.find((c) => c.column === col.columnName);
-      if (!existingCol) {
-        newColumns.push({
-          column: col.columnName,
-          name: col.columnName,
-          datatype: col.datatype,
-          dateCreated: new Date(),
-          dateUpdated: new Date(),
-          deleted: false,
-          description: "",
-          numberFormat: "",
-        });
-      } else {
-        // If the column already exists but was previously removed, restore it.
-        existingCol.deleted = false;
-        existingCol.dateUpdated = new Date();
-      }
-    });
-    columnsToRename.forEach(({ from, to }) => {
-      const col = newColumns.find((c) => c.column === from);
-      if (col) {
-        const existingDestinationCol = newColumns.find((c) => c.column === to);
-        // Destination already exists
-        if (existingDestinationCol) {
-          // Restore destination if it had been previously removed.
-          existingDestinationCol.deleted = false;
-          existingDestinationCol.dateUpdated = new Date();
-          // Mark the old column as deleted.
-          col.deleted = true;
-          col.dateUpdated = new Date();
-        } else {
-          // Otherwise, rename in place
-          col.column = to;
-          col.name = to;
-          col.dateUpdated = new Date();
-        }
-      }
-    });
-    columnsToDelete.forEach((name) => {
-      const col = newColumns.find((c) => c.column === name);
-      if (col) {
-        col.deleted = true;
-        col.dateUpdated = new Date();
-      }
-    });
-
+    const newColumns = applyColumnChangesToFactTable(
+      ft.columns,
+      columnsToAdd,
+      columnsToDelete,
+      columnsToRename,
+    );
     const newIdentifierTypes = finalColumns
       .filter((col) => col.type === "identifier")
       .map((col) => col.columnName);
