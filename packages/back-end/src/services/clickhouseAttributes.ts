@@ -25,16 +25,23 @@ import {
  * Materialized column set a Managed Warehouse should contain: every non-
  * archived, mappable attribute in the org's attributeSchema plus the
  * warehouse's own built-in columns (ingestor-enriched + SDK top-level fields).
- * Built-ins never overlap with attribute columns because the migration and
- * seed paths both exclude built-in names from attributeSchema.
+ *
+ * Attributes and built-ins can conflict by name (an org's default attributes
+ * include `url`, which is also a warehouse built-in). When that happens the
+ * attribute wins so the user's explicit schema is authoritative — the built-in
+ * copy is deduped out to keep the CREATE TABLE column list unique.
  */
 export function getWarehouseMaterializedColumns(
   attributes: SDKAttribute[],
 ): MaterializedColumn[] {
-  return [
-    ...deriveMaterializedColumnsFromAttributes(attributes),
-    ...WAREHOUSE_BUILTIN_COLUMNS,
-  ];
+  const attributeColumns = deriveMaterializedColumnsFromAttributes(attributes);
+  const attributeColumnNames = new Set(
+    attributeColumns.map((c) => c.columnName),
+  );
+  const unshadowedBuiltins = WAREHOUSE_BUILTIN_COLUMNS.filter(
+    (c) => !attributeColumnNames.has(c.columnName),
+  );
+  return [...attributeColumns, ...unshadowedBuiltins];
 }
 
 /**

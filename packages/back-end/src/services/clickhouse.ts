@@ -10,10 +10,7 @@ import {
   MaterializedColumn,
 } from "shared/types/datasource";
 import { DailyUsage } from "shared/types/organization";
-import {
-  deriveMaterializedColumnsFromAttributes,
-  parseIntWithDefault,
-} from "shared/util";
+import { parseIntWithDefault } from "shared/util";
 import { FactTableColumnType } from "shared/types/fact-table";
 import {
   CLICKHOUSE_HOST,
@@ -37,7 +34,10 @@ import {
   unlockDataSource,
   updateDataSource,
 } from "back-end/src/models/DataSourceModel";
-import { ensureManagedWarehouseAttributesMigrated } from "back-end/src/services/clickhouseAttributes";
+import {
+  ensureManagedWarehouseAttributesMigrated,
+  getWarehouseMaterializedColumns,
+} from "back-end/src/services/clickhouseAttributes";
 
 type ClickHouseDataType =
   | "DateTime"
@@ -550,12 +550,9 @@ export async function _dangerousRecreateClickhouseTables(
     logger.info(`Creating Clickhouse database ${database}`);
     await runCommand(client, `CREATE DATABASE ${database}`);
 
-    const materializedColumns = [
-      ...deriveMaterializedColumnsFromAttributes(
-        context.org.settings?.attributeSchema || [],
-      ),
-      ...WAREHOUSE_BUILTIN_COLUMNS,
-    ];
+    const materializedColumns = getWarehouseMaterializedColumns(
+      context.org.settings?.attributeSchema || [],
+    );
     await createClickhouseTables(client, orgId, materializedColumns);
 
     // Reset the snapshot — the recreate is also the intended escape hatch for
