@@ -437,10 +437,16 @@ export function isLegacyPassThroughColumn(col: MaterializedColumn): boolean {
  * `property` isn't already present) and the list of columns we had to skip
  * because we couldn't map their datatype. Pure; no IO.
  *
- * Warehouse built-ins (geo_*, ua_*, utm_*, url_*, …) are maintained outside
- * of attributeSchema — they aren't available to the SDK at assignment time —
- * so they're silently dropped from the backfill even when they appear in the
- * legacy list.
+ * Warehouse built-ins (geo_*, ua_*, utm_*, url_*, …) are normally maintained
+ * outside of attributeSchema — `WAREHOUSE_BUILTIN_COLUMNS` hard-codes them as
+ * dimensions — so they're silently dropped from the backfill. The one
+ * exception is a built-in that the legacy warehouse promoted to identifier
+ * (historically `device_id` was the default identifier on every new managed
+ * warehouse). Without an attribute carrying `hashAttribute: true`, the first
+ * post-migration sync would see that column's role flip from identifier to
+ * dimension, silently removing it from `userIdTypes` and the auto-generated
+ * exposure queries — breaking experiment analysis. We backfill those as
+ * hashAttribute attributes so the attribute shadow preserves the role.
  */
 export function planManagedWarehouseAttributeMigration({
   legacyColumns,
@@ -464,7 +470,14 @@ export function planManagedWarehouseAttributeMigration({
     // but in practice new-style attributes always match sourceField.
     const property = col.sourceField;
 
-    if (WAREHOUSE_BUILTIN_COLUMN_NAMES.has(property)) continue;
+    // Skip built-ins UNLESS the legacy column was an identifier — see the
+    // docstring for why identifier built-ins must round-trip into an attribute.
+    if (
+      WAREHOUSE_BUILTIN_COLUMN_NAMES.has(property) &&
+      col.type !== "identifier"
+    ) {
+      continue;
+    }
 
     if (existingByProperty.has(property) || seenInAdditions.has(property)) {
       continue;

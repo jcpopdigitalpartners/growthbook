@@ -385,6 +385,24 @@ describe("planManagedWarehouseAttributeMigration", () => {
     expect(result.additions.map((a) => a.property)).toEqual(["my_custom_attr"]);
     expect(result.skipped).toEqual([]);
   });
+
+  it("backfills built-in columns that were legacy identifiers so the role is preserved", () => {
+    // Pre-refactor managed warehouses seeded `device_id` as an identifier.
+    // Without an attribute carrying hashAttribute=true, the first post-
+    // migration sync would demote it to dimension (WAREHOUSE_BUILTIN_COLUMNS
+    // hard-codes dimension) and silently strip it from userIdTypes.
+    const result = planManagedWarehouseAttributeMigration({
+      legacyColumns: [
+        legacyCol({ sourceField: "device_id", type: "identifier" }),
+        // Built-in that was a dimension — should still be skipped.
+        legacyCol({ sourceField: "geo_country", type: "dimension" }),
+      ],
+      existingAttributes: [],
+    });
+    expect(result.additions).toEqual([
+      { property: "device_id", datatype: "string", hashAttribute: true },
+    ]);
+  });
 });
 
 describe("validateManagedWarehouseColumnName", () => {

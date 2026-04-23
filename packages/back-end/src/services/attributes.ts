@@ -1,5 +1,4 @@
 import { SDKAttribute } from "shared/types/organization";
-import { GrowthbookClickhouseDataSource } from "shared/types/datasource";
 import { getGrowthbookDatasource } from "back-end/src/models/DataSourceModel";
 import { updateOrganization } from "back-end/src/models/OrganizationModel";
 import {
@@ -58,15 +57,17 @@ export async function updateAttributeSchema(
   },
 ): Promise<void> {
   const { org } = context;
-  let managedWarehouse: GrowthbookClickhouseDataSource | null = null;
+  const managedWarehouse = await getGrowthbookDatasource(context);
 
   // Lazily migrate any legacy Managed Warehouse `materializedColumns` into
   // attributeSchema before doing the user's write. The caller computed
   // `newAttributeSchema` against the pre-migration state, so any attributes
   // that the migration just backfilled would otherwise be dropped from the
   // org. Merge them in — caller's version wins for overlapping properties.
-  const migratedAdditions =
-    await ensureManagedWarehouseAttributesMigrated(context);
+  const migratedAdditions = await ensureManagedWarehouseAttributesMigrated(
+    context,
+    managedWarehouse,
+  );
   if (migratedAdditions.length > 0) {
     const newProperties = new Set(newAttributeSchema.map((a) => a.property));
     newAttributeSchema = [
@@ -81,17 +82,14 @@ export async function updateAttributeSchema(
   // Managed Warehouse. Existing attrs are grandfathered (they'll be silently
   // skipped by derive) so previously-accepted names don't start blocking
   // unrelated attribute edits. Only runs when the org has a Managed Warehouse.
-  if (!skipManagedWarehouseNameValidation) {
-    managedWarehouse = await getGrowthbookDatasource(context);
-    if (managedWarehouse) {
-      const previousProperties = new Set(
-        previousAttributeSchema.map((a) => a.property),
-      );
-      for (const attr of newAttributeSchema) {
-        if (previousProperties.has(attr.property)) continue;
-        const reason = validateManagedWarehouseColumnName(attr.property);
-        if (reason) throw new Error(reason);
-      }
+  if (managedWarehouse && !skipManagedWarehouseNameValidation) {
+    const previousProperties = new Set(
+      previousAttributeSchema.map((a) => a.property),
+    );
+    for (const attr of newAttributeSchema) {
+      if (previousProperties.has(attr.property)) continue;
+      const reason = validateManagedWarehouseColumnName(attr.property);
+      if (reason) throw new Error(reason);
     }
   }
 

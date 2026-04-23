@@ -159,10 +159,8 @@ export function getManagedWarehouseDerivedSettings(
  */
 export async function ensureManagedWarehouseAttributesMigrated(
   context: ReqContext,
+  datasource: GrowthbookClickhouseDataSource | null,
 ): Promise<SDKAttribute[]> {
-  const datasource = (await getGrowthbookDatasource(
-    context,
-  )) as GrowthbookClickhouseDataSource | null;
   if (!datasource) return [];
 
   if (datasource.settings.syncedMaterializedColumns !== undefined) return [];
@@ -364,16 +362,22 @@ async function persistSyncResult(
 
   if (!shouldRegenerateDerivedSettings) return;
 
+  // Re-fetch so the second write spreads post-Write-1 settings. Prevents
+  // future additions to Write 1 from being silently clobbered by a stale
+  // spread here.
+  const refreshed = await getGrowthbookDatasource(context);
+  if (!refreshed) return;
+
   const { userIdTypes, exposureQueries } =
     getManagedWarehouseDerivedSettings(finalColumns);
-  await updateDataSource(context, datasource, {
+  await updateDataSource(context, refreshed, {
     dateUpdated: new Date(),
     settings: {
-      ...datasource.settings,
+      ...refreshed.settings,
       syncedMaterializedColumns: finalColumns,
       userIdTypes,
       queries: {
-        ...datasource.settings.queries,
+        ...refreshed.settings.queries,
         exposure: exposureQueries,
       },
     },

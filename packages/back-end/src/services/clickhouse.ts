@@ -454,7 +454,7 @@ export async function dangerousRecreateClickhouseTables(
   try {
     // If this datasource is still in the legacy representation, migrate first
     // so the recreated tables match the attributeSchema source of truth.
-    await ensureManagedWarehouseAttributesMigrated(context);
+    await ensureManagedWarehouseAttributesMigrated(context, datasource);
 
     // Re-fetch after migration: `datasource` is stale (migration
     // updates the DB but not this copy), and we need the freshly-seeded
