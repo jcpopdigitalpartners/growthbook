@@ -34,7 +34,7 @@ export const putAttribute = createApiRequestHandler(putAttributeValidator)(
     }
 
     await updateAttributeSchema(req.context, {
-      nextAttributeSchema: attributes.map((attr) =>
+      newAttributeSchema: attributes.map((attr) =>
         attr.property === property ? updatedAttribute : attr,
       ),
     });

@@ -1,10 +1,4 @@
 import {
-  computeMaterializedColumnDiff,
-  deriveMaterializedColumnsFromAttributes,
-  isLegacyPassThroughColumn,
-  planManagedWarehouseAttributeMigration,
-} from "shared/util";
-import {
   GrowthbookClickhouseDataSource,
   MaterializedColumn,
 } from "shared/types/datasource";
@@ -18,12 +12,14 @@ import {
   updateDataSource,
 } from "back-end/src/models/DataSourceModel";
 import { updateOrganization } from "back-end/src/models/OrganizationModel";
+import { dangerousUpdateMaterializedColumns } from "back-end/src/services/clickhouse";
 import {
-  dangerousUpdateMaterializedColumns,
-  getReservedColumnNames,
-  WAREHOUSE_BUILTIN_COLUMN_NAMES,
+  computeMaterializedColumnDiff,
+  deriveMaterializedColumnsFromAttributes,
+  isLegacyPassThroughColumn,
+  planManagedWarehouseAttributeMigration,
   WAREHOUSE_BUILTIN_COLUMNS,
-} from "back-end/src/services/clickhouse";
+} from "back-end/src/util/managedWarehouseAttributes";
 
 /**
  * Materialized column set a Managed Warehouse should contain: every non-
@@ -55,7 +51,6 @@ export function getWarehouseMaterializedColumns(
   } = {},
 ): MaterializedColumn[] {
   const attributeColumns = deriveMaterializedColumnsFromAttributes(attributes, {
-    reservedColumnNames: getReservedColumnNames(),
     onInvalidAttribute: (attr, reason) => {
       logger.warn(
         { orgId, property: attr.property, reason },
@@ -158,7 +153,7 @@ export function getManagedWarehouseDerivedSettings(
  * schema and do that work.
  *
  * Returns the attributes that were added so callers can merge them into any
- * in-flight updates to attributeSchema (the caller's `nextAttributeSchema`
+ * in-flight updates to attributeSchema (the caller's `newAttributeSchema`
  * was computed against the pre-migration schema and would otherwise drop
  * the backfilled entries).
  */
@@ -177,10 +172,6 @@ export async function ensureManagedWarehouseAttributesMigrated(
   const { additions, skipped } = planManagedWarehouseAttributeMigration({
     legacyColumns,
     existingAttributes,
-    // Warehouse built-ins (geo_*, ua_*, utm_*, url_*, …) are maintained
-    // outside of attributeSchema, so don't create attributes for them even
-    // when they appear in the legacy list.
-    warehouseBuiltinColumnNames: WAREHOUSE_BUILTIN_COLUMN_NAMES,
   });
 
   if (skipped.length > 0) {
@@ -236,6 +227,7 @@ export async function ensureManagedWarehouseAttributesMigrated(
  */
 export async function syncManagedWarehouseAttributes(
   context: ReqContext,
+  datasource: GrowthbookClickhouseDataSource,
   {
     attributeSchema,
     renames = [],
@@ -244,34 +236,27 @@ export async function syncManagedWarehouseAttributes(
     renames?: { from: string; to: string }[];
   },
 ): Promise<void> {
-  const initialDatasource = (await getGrowthbookDatasource(
-    context,
-  )) as GrowthbookClickhouseDataSource | null;
-  if (!initialDatasource) return;
-
   // Lock the datasource for the entire read-compute-write sequence so two
   // concurrent attribute writes (e.g., a user PUT racing the `$groups` auto-add)
   // can't both read the same snapshot, compute overlapping diffs, and clobber
   // each other's `syncedMaterializedColumns` writes. `lockDataSource` throws
   // if already locked; the caller's catch will roll back the attributeSchema
   // write with a retryable error.
-  await lockDataSource(context, initialDatasource, 300);
+  await lockDataSource(context, datasource, 300);
 
   try {
     // Re-fetch after acquiring the lock so we read the freshest snapshot. Any
     // concurrent writer that finished before us is now visible, and anyone who
     // starts after us will wait on the lock.
-    const datasource = (await getGrowthbookDatasource(
-      context,
-    )) as GrowthbookClickhouseDataSource | null;
-    if (!datasource) return;
+    const refreshedDatasource = await getGrowthbookDatasource(context);
+    if (!refreshedDatasource) return;
 
-    await runManagedWarehouseSync(context, datasource, {
+    await runManagedWarehouseSync(context, refreshedDatasource, {
       attributeSchema,
       renames,
     });
   } finally {
-    await unlockDataSource(context, initialDatasource);
+    await unlockDataSource(context, datasource);
   }
 }
 

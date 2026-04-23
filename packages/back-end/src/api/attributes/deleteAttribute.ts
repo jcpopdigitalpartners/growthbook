@@ -20,7 +20,7 @@ export const deleteAttribute = createApiRequestHandler(
     req.context.permissions.throwPermissionError();
 
   await updateAttributeSchema(req.context, {
-    nextAttributeSchema: attributes.filter((attr) => attr !== attribute),
+    newAttributeSchema: attributes.filter((attr) => attr !== attribute),
   });
 
   await req.audit({

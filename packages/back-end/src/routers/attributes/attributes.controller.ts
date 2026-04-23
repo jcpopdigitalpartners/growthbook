@@ -53,9 +53,9 @@ export const postAttribute = async (
     tags: tags.length > 0 ? tags : undefined,
   };
 
-  const nextAttributeSchema = [...attributeSchema, newAttribute];
+  const newAttributeSchema = [...attributeSchema, newAttribute];
 
-  await updateAttributeSchema(context, { nextAttributeSchema });
+  await updateAttributeSchema(context, { newAttributeSchema });
 
   await req.audit({
     event: "attribute.create",
@@ -67,7 +67,7 @@ export const postAttribute = async (
       { settings: { attributeSchema } },
       {
         settings: {
-          attributeSchema: nextAttributeSchema,
+          attributeSchema: newAttributeSchema,
         },
       },
     ),
@@ -101,7 +101,7 @@ export const putAttribute = async (
 
   // If the name is being changed, we need to access the attribute via its previous name
   const index = attributeSchema.findIndex(
-    (a) => a.property === (previousName ?? property),
+    (a) => a.property === (previousName ? previousName : property),
   );
 
   if (index === -1) {
@@ -147,7 +147,7 @@ export const putAttribute = async (
       : [];
 
   await updateAttributeSchema(context, {
-    nextAttributeSchema: attributeSchema,
+    newAttributeSchema: attributeSchema,
     renames,
   });
 
@@ -192,9 +192,11 @@ export const deleteAttribute = async (
     context.permissions.throwPermissionError();
   }
 
-  const updatedArr = attributeSchema.filter((a) => a.property !== id);
+  const newAttributeSchema = attributeSchema.filter((a) => a.property !== id);
 
-  await updateAttributeSchema(context, { nextAttributeSchema: updatedArr });
+  await updateAttributeSchema(context, {
+    newAttributeSchema,
+  });
 
   await req.audit({
     event: "attribute.delete",
@@ -206,7 +208,7 @@ export const deleteAttribute = async (
       { settings: { attributeSchema: org.settings?.attributeSchema || [] } },
       {
         settings: {
-          attributeSchema: updatedArr,
+          attributeSchema: newAttributeSchema,
         },
       },
     ),
@@ -293,16 +295,13 @@ export const getAttributeReferences = async (
   }
 
   for (const experiment of allExperiments) {
-    // `projects` isn't on the current ExperimentInterface but may exist on
-    // legacy documents; surface it opportunistically.
-    const exp = experiment as typeof experiment & { projects?: string[] };
     const addExp = (key: string) => {
       if (!keySet.has(key)) return;
-      experimentRefs.get(key)!.set(exp.id, {
-        id: exp.id,
-        name: exp.name,
-        project: exp.project,
-        projects: exp.projects,
+      experimentRefs.get(key)!.set(experiment.id, {
+        id: experiment.id,
+        name: experiment.name,
+        project: (experiment as { project?: string }).project,
+        projects: (experiment as { projects?: string[] }).projects,
       });
     };
 

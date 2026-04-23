@@ -1,5 +1,5 @@
-import type { SDKAttribute } from "../../types/organization";
-import type { MaterializedColumn } from "../../types/datasource";
+import type { SDKAttribute } from "shared/types/organization";
+import type { MaterializedColumn } from "shared/types/datasource";
 import {
   computeMaterializedColumnDiff,
   deriveMaterializedColumnsFromAttributes,
@@ -7,7 +7,7 @@ import {
   materializedColumnTypeFromAttribute,
   planManagedWarehouseAttributeMigration,
   validateManagedWarehouseColumnName,
-} from "../../src/util/managed-warehouse-attributes";
+} from "back-end/src/util/managedWarehouseAttributes";
 
 describe("materializedColumnTypeFromAttribute", () => {
   it("maps scalar types", () => {
@@ -273,25 +273,25 @@ describe("planManagedWarehouseAttributeMigration", () => {
   it("converts identifier + dimension columns into attributes", () => {
     const result = planManagedWarehouseAttributeMigration({
       legacyColumns: [
-        legacyCol({ sourceField: "device_id", type: "identifier" }),
-        legacyCol({ sourceField: "geo_country", type: "dimension" }),
-        legacyCol({ sourceField: "url_path", type: "" }),
+        legacyCol({ sourceField: "my_user_id", type: "identifier" }),
+        legacyCol({ sourceField: "country", type: "dimension" }),
+        legacyCol({ sourceField: "page_path", type: "" }),
       ],
       existingAttributes: [],
     });
     expect(result.additions).toEqual([
       {
-        property: "device_id",
+        property: "my_user_id",
         datatype: "string",
         hashAttribute: true,
       },
       {
-        property: "geo_country",
+        property: "country",
         datatype: "string",
         hashAttribute: false,
       },
       {
-        property: "url_path",
+        property: "page_path",
         datatype: "string",
         hashAttribute: false,
       },
@@ -302,16 +302,16 @@ describe("planManagedWarehouseAttributeMigration", () => {
   it("skips legacy columns that already have an attribute", () => {
     const result = planManagedWarehouseAttributeMigration({
       legacyColumns: [
-        legacyCol({ sourceField: "device_id", type: "identifier" }),
-        legacyCol({ sourceField: "geo_country", type: "dimension" }),
+        legacyCol({ sourceField: "my_user_id", type: "identifier" }),
+        legacyCol({ sourceField: "country", type: "dimension" }),
       ],
       existingAttributes: [
         // Already present, and with a different hashAttribute value: we
         // preserve the user's version and don't touch it.
-        { property: "device_id", datatype: "string", hashAttribute: false },
+        { property: "my_user_id", datatype: "string", hashAttribute: false },
       ],
     });
-    expect(result.additions.map((a) => a.property)).toEqual(["geo_country"]);
+    expect(result.additions.map((a) => a.property)).toEqual(["country"]);
   });
 
   it("maps number and boolean legacy datatypes", () => {
@@ -381,7 +381,6 @@ describe("planManagedWarehouseAttributeMigration", () => {
         legacyCol({ sourceField: "my_custom_attr", type: "dimension" }),
       ],
       existingAttributes: [],
-      warehouseBuiltinColumnNames: new Set(["geo_country", "ua_browser"]),
     });
     expect(result.additions.map((a) => a.property)).toEqual(["my_custom_attr"]);
     expect(result.skipped).toEqual([]);
@@ -389,69 +388,50 @@ describe("planManagedWarehouseAttributeMigration", () => {
 });
 
 describe("validateManagedWarehouseColumnName", () => {
-  const reserved = new Set(["timestamp", "event_name"]);
-
   it("returns null for valid identifiers", () => {
-    expect(validateManagedWarehouseColumnName("foo", reserved)).toBeNull();
-    expect(validateManagedWarehouseColumnName("_foo", reserved)).toBeNull();
-    expect(validateManagedWarehouseColumnName("foo_bar_42", reserved)).toBeNull();
+    expect(validateManagedWarehouseColumnName("foo")).toBeUndefined();
+    expect(validateManagedWarehouseColumnName("_foo")).toBeUndefined();
+    expect(validateManagedWarehouseColumnName("foo_bar_42")).toBeUndefined();
   });
 
   it("rejects names that don't match the identifier regex", () => {
-    expect(validateManagedWarehouseColumnName("$groups", reserved)).toMatch(
+    expect(validateManagedWarehouseColumnName("$groups")).toMatch(
       /letter or underscore/,
     );
-    expect(validateManagedWarehouseColumnName("user.id", reserved)).toMatch(
+    expect(validateManagedWarehouseColumnName("user.id")).toMatch(
       /letter or underscore/,
     );
-    expect(validateManagedWarehouseColumnName("user id", reserved)).toMatch(
+    expect(validateManagedWarehouseColumnName("user id")).toMatch(
       /letter or underscore/,
     );
-    expect(validateManagedWarehouseColumnName("1foo", reserved)).toMatch(
+    expect(validateManagedWarehouseColumnName("1foo")).toMatch(
       /letter or underscore/,
     );
-    expect(validateManagedWarehouseColumnName("", reserved)).toMatch(
+    expect(validateManagedWarehouseColumnName("")).toMatch(
       /letter or underscore/,
     );
   });
 
   it("rejects reserved column names case-insensitively", () => {
-    expect(validateManagedWarehouseColumnName("timestamp", reserved)).toMatch(
+    expect(validateManagedWarehouseColumnName("timestamp")).toMatch(/reserved/);
+    expect(validateManagedWarehouseColumnName("TIMESTAMP")).toMatch(/reserved/);
+    expect(validateManagedWarehouseColumnName("event_name")).toMatch(
       /reserved/,
     );
-    expect(validateManagedWarehouseColumnName("TIMESTAMP", reserved)).toMatch(
-      /reserved/,
-    );
-    expect(validateManagedWarehouseColumnName("event_name", reserved)).toMatch(
+    expect(validateManagedWarehouseColumnName("sdk_version")).toMatch(
       /reserved/,
     );
   });
 
   it("rejects SQL keywords case-insensitively", () => {
-    expect(validateManagedWarehouseColumnName("select", reserved)).toMatch(
-      /SQL keyword/,
-    );
-    expect(validateManagedWarehouseColumnName("FROM", reserved)).toMatch(
-      /SQL keyword/,
-    );
-    expect(validateManagedWarehouseColumnName("case", reserved)).toMatch(
-      /SQL keyword/,
-    );
+    expect(validateManagedWarehouseColumnName("select")).toMatch(/SQL keyword/);
+    expect(validateManagedWarehouseColumnName("FROM")).toMatch(/SQL keyword/);
+    expect(validateManagedWarehouseColumnName("case")).toMatch(/SQL keyword/);
   });
 });
 
 describe("deriveMaterializedColumnsFromAttributes invalid-name skipping", () => {
-  it("returns everything by default (no validation)", () => {
-    const attrs: SDKAttribute[] = [
-      { property: "valid", datatype: "string" },
-      { property: "$groups", datatype: "string[]" },
-    ];
-    const result = deriveMaterializedColumnsFromAttributes(attrs);
-    expect(result.map((c) => c.columnName)).toEqual(["valid", "$groups"]);
-  });
-
-  it("skips invalid names when reservedColumnNames is passed", () => {
-    const reserved = new Set(["timestamp"]);
+  it("skips invalid names and reports them", () => {
     const skipped: string[] = [];
     const attrs: SDKAttribute[] = [
       { property: "valid", datatype: "string" },
@@ -461,7 +441,6 @@ describe("deriveMaterializedColumnsFromAttributes invalid-name skipping", () => 
       { property: "user.id", datatype: "string" },
     ];
     const result = deriveMaterializedColumnsFromAttributes(attrs, {
-      reservedColumnNames: reserved,
       onInvalidAttribute: (attr) => skipped.push(attr.property),
     });
     expect(result.map((c) => c.columnName)).toEqual(["valid"]);
@@ -469,10 +448,9 @@ describe("deriveMaterializedColumnsFromAttributes invalid-name skipping", () => 
   });
 
   it("allows underscore-prefixed names", () => {
-    const result = deriveMaterializedColumnsFromAttributes(
-      [{ property: "_foo", datatype: "string" }],
-      { reservedColumnNames: new Set() },
-    );
+    const result = deriveMaterializedColumnsFromAttributes([
+      { property: "_foo", datatype: "string" },
+    ]);
     expect(result.map((c) => c.columnName)).toEqual(["_foo"]);
   });
 });

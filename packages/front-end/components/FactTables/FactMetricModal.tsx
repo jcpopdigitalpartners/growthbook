@@ -252,14 +252,12 @@ function getColumnOptions({
 
   // Add JSON fields
   if (includeJSONFields && factTable?.columns) {
-    const excludedAttributeFields = new Set<string>();
-    if (datasource && datasource.type === "growthbook_clickhouse") {
-      // When an attribute has been materialized to the top-level,
-      // we want people to use the top-level column and not a JSON field
-      attributeSchema.forEach((attr) => {
-        if (!attr.archived) excludedAttributeFields.add(attr.property);
-      });
-    }
+    // When an attribute has been materialized to the top-level,
+    // we want people to use the top-level column and not a JSON field
+    const excludedAttributeFields =
+      datasource?.type === "growthbook_clickhouse"
+        ? new Set(attributeSchema.map((attr) => attr.property))
+        : new Set<string>();
 
     const jsonColumns = factTable.columns.filter(
       (col) => col.datatype === "json" && !col.deleted,
@@ -428,7 +426,7 @@ function ColumnRefSelector({
   allowChangingDatasource?: boolean;
 }) {
   const { getFactTableById, factTables } = useDefinitions();
-  const attributeSchema = useAttributeSchema(true);
+  const attributeSchema = useAttributeSchema();
 
   let factTable = getFactTableById(value.factTableId);
   if (factTable?.datasource !== datasource.id) factTable = null;

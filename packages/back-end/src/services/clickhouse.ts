@@ -10,11 +10,17 @@ import {
   MaterializedColumn,
 } from "shared/types/datasource";
 import { DailyUsage } from "shared/types/organization";
-import { parseIntWithDefault, isLegacyPassThroughColumn } from "shared/util";
+import { parseIntWithDefault } from "shared/util";
 import {
   FactTableColumnType,
   FactTableInterface,
 } from "shared/types/fact-table";
+import {
+  ClickHouseDataType,
+  isLegacyPassThroughColumn,
+  MANAGED_WAREHOUSE_REMAINING_COLUMNS,
+  WAREHOUSE_BUILTIN_FIELD_TYPES,
+} from "back-end/src/util/managedWarehouseAttributes";
 import {
   CLICKHOUSE_HOST,
   CLICKHOUSE_ADMIN_USER,
@@ -43,93 +49,6 @@ import {
   extractColumnNameOverrides,
   getWarehouseMaterializedColumns,
 } from "back-end/src/services/clickhouseAttributes";
-
-type ClickHouseDataType =
-  | "DateTime"
-  | "Float64"
-  | "Boolean"
-  | "String"
-  | "LowCardinality(String)"
-  | "Array(String)"
-  | "Array(Float64)";
-
-// Columns the ingestor writes to the top-level of the `events` table. These
-// are either server-enriched (geo_*, ua_*, url_{path,host,query,fragment}) or
-// SDK-sent top-level fields (device_id, utm_*, url, …) — none of them live
-// inside `context_json`, so they aren't visible to the SDK at feature /
-// experiment assignment time. We materialize them for dimension analysis but
-// they are NOT part of the org's attributeSchema.
-const WAREHOUSE_BUILTIN_FIELD_TYPES: Record<string, ClickHouseDataType> = {
-  user_id: "String",
-  url: "String",
-  url_path: "String",
-  url_host: "String",
-  url_query: "String",
-  url_fragment: "String",
-  device_id: "String",
-  page_id: "String",
-  session_id: "String",
-  page_title: "String",
-  utm_source: "String",
-  utm_medium: "String",
-  utm_campaign: "String",
-  utm_term: "String",
-  utm_content: "String",
-  geo_country: "String",
-  geo_city: "String",
-  geo_lat: "Float64",
-  geo_lon: "Float64",
-  ua: "String",
-  ua_browser: "String",
-  ua_os: "String",
-  ua_device_type: "String",
-};
-
-function clickhouseTypeToFactTableType(
-  type: ClickHouseDataType,
-): FactTableColumnType {
-  switch (type) {
-    case "Float64":
-      return "number";
-    case "Boolean":
-      return "boolean";
-    case "DateTime":
-      return "date";
-    case "String":
-    case "LowCardinality(String)":
-    case "Array(String)":
-    case "Array(Float64)":
-      return "string";
-  }
-}
-
-/**
- * Warehouse-owned materialized columns that we always maintain in ClickHouse,
- * independent of the organization's attributeSchema. These correspond to the
- * ingestor's enrichment + SDK top-level fields and are used for dimension
- * analysis; they are never exposed through `attributeSchema` because they
- * aren't available to the SDK at assignment time.
- */
-export const WAREHOUSE_BUILTIN_COLUMNS: MaterializedColumn[] = Object.entries(
-  WAREHOUSE_BUILTIN_FIELD_TYPES,
-).map(([name, type]) => ({
-  columnName: name,
-  sourceField: name,
-  datatype: clickhouseTypeToFactTableType(type),
-  type: "dimension",
-}));
-
-export const WAREHOUSE_BUILTIN_COLUMN_NAMES: Set<string> = new Set(
-  WAREHOUSE_BUILTIN_COLUMNS.map((c) => c.columnName),
-);
-
-const REMAINING_COLUMNS_SCHEMA: Record<string, ClickHouseDataType> = {
-  environment: "LowCardinality(String)",
-  sdk_language: "LowCardinality(String)",
-  sdk_version: "LowCardinality(String)",
-  event_uuid: "String",
-  ip: "String",
-};
 
 function clickhouseUserId(orgId: string) {
   // Sanity check. An orgId of `default` or another reserved word would seriously mess things up
@@ -226,23 +145,6 @@ function getClickhouseExtractClause(
   }
 }
 
-const RESERVED_COLUMN_NAMES: ReadonlySet<string> = new Set(
-  [
-    "timestamp",
-    "client_key",
-    "event_name",
-    "properties",
-    "attributes",
-    "experiment_id",
-    "variation_id",
-    ...Object.keys(REMAINING_COLUMNS_SCHEMA),
-  ].map((col) => col.toLowerCase()),
-);
-
-export function getReservedColumnNames(): ReadonlySet<string> {
-  return RESERVED_COLUMN_NAMES;
-}
-
 type ColumnDef = {
   source: string;
   alias?: string;
@@ -262,10 +164,12 @@ function getSelectColumnList(columns: ColumnDef[]): string[] {
 }
 
 function getRemainingColumnDefs(): ColumnDef[] {
-  return Object.entries(REMAINING_COLUMNS_SCHEMA).map(([colName, colType]) => ({
-    source: colName,
-    datatype: colType as ClickHouseDataType,
-  }));
+  return Object.entries(MANAGED_WAREHOUSE_REMAINING_COLUMNS).map(
+    ([colName, colType]) => ({
+      source: colName,
+      datatype: colType,
+    }),
+  );
 }
 
 function getMaterializedColumnDefs(

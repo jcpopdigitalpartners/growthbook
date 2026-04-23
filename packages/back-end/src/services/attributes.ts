@@ -1,13 +1,13 @@
 import { SDKAttribute } from "shared/types/organization";
-import { validateManagedWarehouseColumnName } from "shared/util";
+import { GrowthbookClickhouseDataSource } from "shared/types/datasource";
 import { getGrowthbookDatasource } from "back-end/src/models/DataSourceModel";
 import { updateOrganization } from "back-end/src/models/OrganizationModel";
-import { getReservedColumnNames } from "back-end/src/services/clickhouse";
 import {
   ensureManagedWarehouseAttributesMigrated,
   syncManagedWarehouseAttributes,
 } from "back-end/src/services/clickhouseAttributes";
 import { logger } from "back-end/src/util/logger";
+import { validateManagedWarehouseColumnName } from "back-end/src/util/managedWarehouseAttributes";
 import { ReqContext } from "back-end/types/request";
 
 export async function removeTagInAttribute(
@@ -26,7 +26,7 @@ export async function removeTagInAttribute(
   }));
 
   await updateAttributeSchema(context, {
-    nextAttributeSchema: updatedAttributeSchema,
+    newAttributeSchema: updatedAttributeSchema,
   });
 }
 
@@ -42,11 +42,11 @@ export async function removeTagInAttribute(
 export async function updateAttributeSchema(
   context: ReqContext,
   {
-    nextAttributeSchema,
+    newAttributeSchema,
     renames = [],
     skipManagedWarehouseNameValidation = false,
   }: {
-    nextAttributeSchema: SDKAttribute[];
+    newAttributeSchema: SDKAttribute[];
     renames?: { from: string; to: string }[];
     /**
      * Bypass the Managed Warehouse column-name validation. Intended for
@@ -58,19 +58,20 @@ export async function updateAttributeSchema(
   },
 ): Promise<void> {
   const { org } = context;
+  let managedWarehouse: GrowthbookClickhouseDataSource | null = null;
 
   // Lazily migrate any legacy Managed Warehouse `materializedColumns` into
   // attributeSchema before doing the user's write. The caller computed
-  // `nextAttributeSchema` against the pre-migration state, so any attributes
+  // `newAttributeSchema` against the pre-migration state, so any attributes
   // that the migration just backfilled would otherwise be dropped from the
   // org. Merge them in — caller's version wins for overlapping properties.
   const migratedAdditions =
     await ensureManagedWarehouseAttributesMigrated(context);
   if (migratedAdditions.length > 0) {
-    const nextProperties = new Set(nextAttributeSchema.map((a) => a.property));
-    nextAttributeSchema = [
-      ...nextAttributeSchema,
-      ...migratedAdditions.filter((a) => !nextProperties.has(a.property)),
+    const newProperties = new Set(newAttributeSchema.map((a) => a.property));
+    newAttributeSchema = [
+      ...newAttributeSchema,
+      ...migratedAdditions.filter((a) => !newProperties.has(a.property)),
     ];
   }
 
@@ -81,35 +82,33 @@ export async function updateAttributeSchema(
   // skipped by derive) so previously-accepted names don't start blocking
   // unrelated attribute edits. Only runs when the org has a Managed Warehouse.
   if (!skipManagedWarehouseNameValidation) {
-    const managedWarehouse = await getGrowthbookDatasource(context);
+    managedWarehouse = await getGrowthbookDatasource(context);
     if (managedWarehouse) {
       const previousProperties = new Set(
         previousAttributeSchema.map((a) => a.property),
       );
-      const reservedColumnNames = getReservedColumnNames();
-      for (const attr of nextAttributeSchema) {
+      for (const attr of newAttributeSchema) {
         if (previousProperties.has(attr.property)) continue;
-        const reason = validateManagedWarehouseColumnName(
-          attr.property,
-          reservedColumnNames,
-        );
+        const reason = validateManagedWarehouseColumnName(attr.property);
         if (reason !== null) throw new Error(reason);
       }
     }
   }
 
   await updateOrganization(org.id, {
-    settings: { ...org.settings, attributeSchema: nextAttributeSchema },
+    settings: { ...org.settings, attributeSchema: newAttributeSchema },
   });
 
-  try {
-    await syncManagedWarehouseAttributes(context, {
-      attributeSchema: nextAttributeSchema,
-      renames,
-    });
-  } catch (e) {
-    await rollbackAttributeSchema(context, previousAttributeSchema);
-    throw e;
+  if (managedWarehouse) {
+    try {
+      await syncManagedWarehouseAttributes(context, managedWarehouse, {
+        attributeSchema: newAttributeSchema,
+        renames,
+      });
+    } catch (e) {
+      await rollbackAttributeSchema(context, previousAttributeSchema);
+      throw e;
+    }
   }
 }
 

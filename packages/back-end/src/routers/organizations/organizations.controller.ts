@@ -1686,7 +1686,7 @@ export const autoAddGroupsAttribute = async (
     added = true;
 
     await updateAttributeSchema(context, {
-      nextAttributeSchema: newAttributeSchema,
+      newAttributeSchema,
       // `$groups` isn't a valid ClickHouse identifier; skip the Managed
       // Warehouse name check so system-triggered auto-add always succeeds.
       // The attribute is still created for SDK / saved-group purposes,

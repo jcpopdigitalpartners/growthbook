@@ -33,10 +33,7 @@ export const postAttribute = createApiRequestHandler(postAttributeValidator)(
     }
 
     await updateAttributeSchema(req.context, {
-      nextAttributeSchema: [
-        ...(org.settings?.attributeSchema || []),
-        attribute,
-      ],
+      newAttributeSchema: [...(org.settings?.attributeSchema || []), attribute],
     });
 
     await req.audit({

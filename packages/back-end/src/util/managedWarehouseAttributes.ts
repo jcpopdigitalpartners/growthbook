@@ -1,19 +1,130 @@
-import type { SDKAttribute, SDKAttributeType } from "../../types/organization";
-import type { MaterializedColumn } from "../../types/datasource";
-import type { FactTableColumnType } from "../../types/fact-table";
+import type { SDKAttribute, SDKAttributeType } from "shared/types/organization";
+import type { MaterializedColumn } from "shared/types/datasource";
+import type { FactTableColumnType } from "shared/types/fact-table";
+
+export type ClickHouseDataType =
+  | "DateTime"
+  | "Float64"
+  | "Boolean"
+  | "String"
+  | "LowCardinality(String)"
+  | "Array(String)"
+  | "Array(Float64)";
+
+/**
+ * Columns the Managed Warehouse always writes alongside user attributes.
+ * Centralized here so `RESERVED_MANAGED_WAREHOUSE_COLUMN_NAMES` and the
+ * back-end table DDL share a single source of truth.
+ */
+export const MANAGED_WAREHOUSE_REMAINING_COLUMNS: Record<
+  string,
+  ClickHouseDataType
+> = {
+  environment: "LowCardinality(String)",
+  sdk_language: "LowCardinality(String)",
+  sdk_version: "LowCardinality(String)",
+  event_uuid: "String",
+  ip: "String",
+};
+
+/**
+ * Columns the ingestor writes to the top-level of the `events` table. These
+ * are either server-enriched (geo_*, ua_*, url_{path,host,query,fragment}) or
+ * SDK-sent top-level fields (device_id, utm_*, url, …) — none of them live
+ * inside `context_json`, so they aren't visible to the SDK at feature /
+ * experiment assignment time. We materialize them for dimension analysis but
+ * they are NOT part of the org's attributeSchema.
+ */
+export const WAREHOUSE_BUILTIN_FIELD_TYPES: Record<string, ClickHouseDataType> =
+  {
+    user_id: "String",
+    url: "String",
+    url_path: "String",
+    url_host: "String",
+    url_query: "String",
+    url_fragment: "String",
+    device_id: "String",
+    page_id: "String",
+    session_id: "String",
+    page_title: "String",
+    utm_source: "String",
+    utm_medium: "String",
+    utm_campaign: "String",
+    utm_term: "String",
+    utm_content: "String",
+    geo_country: "String",
+    geo_city: "String",
+    geo_lat: "Float64",
+    geo_lon: "Float64",
+    ua: "String",
+    ua_browser: "String",
+    ua_os: "String",
+    ua_device_type: "String",
+  };
+
+function clickhouseTypeToFactTableType(
+  type: ClickHouseDataType,
+): FactTableColumnType {
+  switch (type) {
+    case "Float64":
+      return "number";
+    case "Boolean":
+      return "boolean";
+    case "DateTime":
+      return "date";
+    case "String":
+    case "LowCardinality(String)":
+    case "Array(String)":
+    case "Array(Float64)":
+      return "string";
+  }
+}
+
+/**
+ * Warehouse-owned materialized columns that we always maintain in ClickHouse,
+ * independent of the organization's attributeSchema. These correspond to the
+ * ingestor's enrichment + SDK top-level fields and are used for dimension
+ * analysis; they are never exposed through `attributeSchema` because they
+ * aren't available to the SDK at assignment time.
+ */
+export const WAREHOUSE_BUILTIN_COLUMNS: MaterializedColumn[] = Object.entries(
+  WAREHOUSE_BUILTIN_FIELD_TYPES,
+).map(([name, type]) => ({
+  columnName: name,
+  sourceField: name,
+  datatype: clickhouseTypeToFactTableType(type),
+  type: "dimension",
+}));
+
+export const WAREHOUSE_BUILTIN_COLUMN_NAMES: ReadonlySet<string> = new Set(
+  WAREHOUSE_BUILTIN_COLUMNS.map((c) => c.columnName),
+);
+
+/**
+ * Lowercased set of base-table column names that user attributes must not
+ * collide with on a Managed Warehouse.
+ */
+export const RESERVED_MANAGED_WAREHOUSE_COLUMN_NAMES: ReadonlySet<string> =
+  new Set(
+    [
+      "timestamp",
+      "client_key",
+      "event_name",
+      "properties",
+      "attributes",
+      "experiment_id",
+      "variation_id",
+      ...Object.keys(MANAGED_WAREHOUSE_REMAINING_COLUMNS),
+    ].map((col) => col.toLowerCase()),
+  );
 
 /**
  * Map an SDK attribute datatype to the MaterializedColumn representation the
  * ClickHouse service uses to generate DDL.
- *
- * Returns `undefined` as a defensive fallback so a newly added SDK datatype
- * defaults to "skip" rather than silently creating the wrong column type.
  */
 export function materializedColumnTypeFromAttribute(
   datatype: SDKAttribute["datatype"],
-):
-  | { datatype: FactTableColumnType; arrayElementType?: "string" | "number" }
-  | undefined {
+): { datatype: FactTableColumnType; arrayElementType?: "string" | "number" } {
   switch (datatype) {
     case "string":
     case "secureString":
@@ -28,8 +139,6 @@ export function materializedColumnTypeFromAttribute(
       return { datatype: "string", arrayElementType: "string" };
     case "number[]":
       return { datatype: "number", arrayElementType: "number" };
-    default:
-      return undefined;
   }
 }
 
@@ -42,20 +151,17 @@ export function materializedColumnTypeFromAttribute(
  * queries). Array-typed attributes are never identifiers because `hashAttribute`
  * is scalar-only in the UI and SDK.
  *
- * When `reservedColumnNames` is provided, attributes whose `property` isn't a
- * valid Managed Warehouse column name (unquoted-identifier rules, SQL keyword
- * blocklist, reserved-column collision) are skipped rather than materialized.
- * `onInvalidAttribute` is invoked for each skipped attribute so callers can
- * log the skip. This is the safety net that keeps system-added attributes
- * like `$groups` from blowing up sync with a raw ClickHouse DDL error.
+ * Attributes whose `property` isn't a valid Managed Warehouse column name
+ * are skipped rather than materialized. `onInvalidAttribute` is invoked
+ * for each skipped attribute so callers can log the skip. This is the
+ * safety net that keeps system-added attributes like `$groups` from
+ * blowing up sync with a raw ClickHouse DDL error.
  */
 export function deriveMaterializedColumnsFromAttributes(
   attributes: SDKAttribute[],
   {
-    reservedColumnNames,
     onInvalidAttribute,
   }: {
-    reservedColumnNames?: ReadonlySet<string>;
     onInvalidAttribute?: (attribute: SDKAttribute, reason: string) => void;
   } = {},
 ): MaterializedColumn[] {
@@ -64,21 +170,15 @@ export function deriveMaterializedColumnsFromAttributes(
   for (const attr of attributes) {
     if (attr.archived) continue;
 
-    const mapped = materializedColumnTypeFromAttribute(attr.datatype);
-    if (!mapped) continue;
+    const matColType = materializedColumnTypeFromAttribute(attr.datatype);
 
-    if (reservedColumnNames) {
-      const invalidReason = validateManagedWarehouseColumnName(
-        attr.property,
-        reservedColumnNames,
-      );
-      if (invalidReason !== null) {
-        onInvalidAttribute?.(attr, invalidReason);
-        continue;
-      }
+    const invalidReason = validateManagedWarehouseColumnName(attr.property);
+    if (invalidReason) {
+      onInvalidAttribute?.(attr, invalidReason);
+      continue;
     }
 
-    const isArray = !!mapped.arrayElementType;
+    const isArray = !!matColType.arrayElementType;
     const canBeIdentifier =
       !isArray && (attr.datatype === "string" || attr.datatype === "number");
     const isIdentifier = canBeIdentifier && attr.hashAttribute === true;
@@ -86,9 +186,9 @@ export function deriveMaterializedColumnsFromAttributes(
     columns.push({
       columnName: attr.property,
       sourceField: attr.property,
-      datatype: mapped.datatype,
+      datatype: matColType.datatype,
       type: isIdentifier ? "identifier" : "dimension",
-      arrayElementType: mapped.arrayElementType,
+      arrayElementType: matColType.arrayElementType,
     });
   }
 
@@ -190,11 +290,15 @@ export function computeMaterializedColumnDiff({
 
 /**
  * Map a legacy MaterializedColumn's FactTableColumnType to the SDKAttribute
- * datatype it should become during backfill. Returns undefined for unmapped
- * datatypes (date / json / other) — those are logged and skipped during
- * migration rather than silently converted.
+ * datatype it corresponds to, or `undefined` if the column can't be
+ * represented as an attribute (date / json / other / "" — datatypes the old
+ * Managed Warehouse UI allowed but the attribute-driven flow can't express).
+ *
+ * Used for two things: the one-time legacy-column → attribute backfill, and
+ * as a capability test in the sync layer for classifying orphaned snapshot
+ * columns as legacy pass-throughs.
  */
-export function legacyMaterializedColumnDatatypeToAttribute(
+export function attributeDatatypeForLegacyColumn(
   datatype: FactTableColumnType,
 ): SDKAttributeType | undefined {
   switch (datatype) {
@@ -204,11 +308,12 @@ export function legacyMaterializedColumnDatatypeToAttribute(
       return "number";
     case "boolean":
       return "boolean";
-    default:
-      // date / json / other / ""
-      // These cannot round-trip to an attribute cleanly, but in practice
-      // the old UI only allowed string / number / boolean / "other" (which
-      // was stored as string).
+    // The rest can't round-trip to an attribute cleanly. In practice the old
+    // UI only allowed string / number / boolean / "other" (stored as string).
+    case "date":
+    case "json":
+    case "other":
+    case "":
       return undefined;
   }
 }
@@ -273,26 +378,23 @@ export const MANAGED_WAREHOUSE_SQL_KEYWORD_BLOCKLIST: ReadonlySet<string> =
 
 /**
  * Validate that a name is safe to use as an unquoted ClickHouse column name on
- * a Managed Warehouse datasource. Returns `null` when valid, or a
- * human-readable error message describing the problem. `reservedColumnNames`
- * should be the lowercased set of base-table column names that attributes
- * must not collide with (e.g., `timestamp`, `event_name`, `sdk_version`).
+ * a Managed Warehouse datasource. Returns `undefined` when valid, or a
+ * human-readable error message describing the problem.
  */
 export function validateManagedWarehouseColumnName(
   name: string,
-  reservedColumnNames: ReadonlySet<string>,
-): string | null {
+): string | undefined {
   if (!CLICKHOUSE_IDENTIFIER_REGEX.test(name)) {
     return `Attribute name "${name}" can't be used as a Managed Warehouse column — names must start with a letter or underscore and contain only alphanumerics and underscores.`;
   }
   const lowered = name.toLowerCase();
-  if (reservedColumnNames.has(lowered)) {
+  if (RESERVED_MANAGED_WAREHOUSE_COLUMN_NAMES.has(lowered)) {
     return `Attribute name "${name}" collides with a reserved Managed Warehouse column.`;
   }
   if (MANAGED_WAREHOUSE_SQL_KEYWORD_BLOCKLIST.has(lowered)) {
     return `Attribute name "${name}" is a SQL keyword and can't be used as a Managed Warehouse column.`;
   }
-  return null;
+  return undefined;
 }
 
 /**
@@ -311,9 +413,7 @@ export function validateManagedWarehouseColumnName(
  */
 export function isLegacyPassThroughColumn(col: MaterializedColumn): boolean {
   if (col.arrayElementType) return false;
-  return (
-    legacyMaterializedColumnDatatypeToAttribute(col.datatype) === undefined
-  );
+  return attributeDatatypeForLegacyColumn(col.datatype) === undefined;
 }
 
 /**
@@ -323,20 +423,17 @@ export function isLegacyPassThroughColumn(col: MaterializedColumn): boolean {
  * `property` isn't already present) and the list of columns we had to skip
  * because we couldn't map their datatype. Pure; no IO.
  *
- * `warehouseBuiltinColumnNames` is the set of columns that are maintained by
- * the warehouse itself (ingestor-produced fields like `ua_browser`,
- * `geo_country`, `utm_source`, …). Those never become attributes — they
- * aren't available to the SDK at assignment time — so we silently drop them
- * from the backfill even when they appear in the legacy list.
+ * Warehouse built-ins (geo_*, ua_*, utm_*, url_*, …) are maintained outside
+ * of attributeSchema — they aren't available to the SDK at assignment time —
+ * so they're silently dropped from the backfill even when they appear in the
+ * legacy list.
  */
 export function planManagedWarehouseAttributeMigration({
   legacyColumns,
   existingAttributes,
-  warehouseBuiltinColumnNames,
 }: {
   legacyColumns: MaterializedColumn[];
   existingAttributes: SDKAttribute[];
-  warehouseBuiltinColumnNames?: ReadonlySet<string>;
 }): {
   additions: SDKAttribute[];
   skipped: { columnName: string; reason: string }[];
@@ -353,17 +450,13 @@ export function planManagedWarehouseAttributeMigration({
     // but in practice new-style attributes always match sourceField.
     const property = col.sourceField;
 
-    if (warehouseBuiltinColumnNames?.has(property)) {
-      // Covered by the warehouse built-in column set; not an SDK-visible
-      // attribute, so don't backfill.
-      continue;
-    }
+    if (WAREHOUSE_BUILTIN_COLUMN_NAMES.has(property)) continue;
 
     if (existingByProperty.has(property) || seenInAdditions.has(property)) {
       continue;
     }
 
-    const datatype = legacyMaterializedColumnDatatypeToAttribute(col.datatype);
+    const datatype = attributeDatatypeForLegacyColumn(col.datatype);
     if (!datatype) {
       skipped.push({
         columnName: col.columnName,
