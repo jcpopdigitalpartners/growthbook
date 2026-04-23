@@ -43,9 +43,23 @@ export function materializedColumnTypeFromAttribute(
  * identifiers (they flow into `userIdTypes` and the auto-generated exposure
  * queries). Array-typed attributes are never identifiers because `hashAttribute`
  * is scalar-only in the UI and SDK.
+ *
+ * When `reservedColumnNames` is provided, attributes whose `property` isn't a
+ * valid Managed Warehouse column name (unquoted-identifier rules, SQL keyword
+ * blocklist, reserved-column collision) are skipped rather than materialized.
+ * `onInvalidAttribute` is invoked for each skipped attribute so callers can
+ * log the skip. This is the safety net that keeps system-added attributes
+ * like `$groups` from blowing up sync with a raw ClickHouse DDL error.
  */
 export function deriveMaterializedColumnsFromAttributes(
   attributes: SDKAttribute[],
+  {
+    reservedColumnNames,
+    onInvalidAttribute,
+  }: {
+    reservedColumnNames?: ReadonlySet<string>;
+    onInvalidAttribute?: (attribute: SDKAttribute, reason: string) => void;
+  } = {},
 ): MaterializedColumn[] {
   const columns: MaterializedColumn[] = [];
 
@@ -54,6 +68,17 @@ export function deriveMaterializedColumnsFromAttributes(
 
     const mapped = materializedColumnTypeFromAttribute(attr.datatype);
     if (!mapped) continue;
+
+    if (reservedColumnNames) {
+      const invalidReason = validateManagedWarehouseColumnName(
+        attr.property,
+        reservedColumnNames,
+      );
+      if (invalidReason !== null) {
+        onInvalidAttribute?.(attr, invalidReason);
+        continue;
+      }
+    }
 
     const isArray = !!mapped.arrayElementType;
     const canBeIdentifier =
@@ -190,6 +215,107 @@ export function legacyMaterializedColumnDatatypeToAttribute(
       // was stored as string).
       return undefined;
   }
+}
+
+/**
+ * ClickHouse unquoted identifiers must match this regex — starts with a letter
+ * or underscore, followed by alphanumerics or underscores. Anything else
+ * (`$`, `.`, spaces, hyphens, leading digits) is invalid unless we quote it,
+ * and our DDL generator emits unquoted identifiers.
+ */
+const CLICKHOUSE_IDENTIFIER_REGEX = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+
+/**
+ * SQL keywords that technically work as backticked column names but are
+ * confusing enough in query output that we reject them outright. Mirrors the
+ * pre-refactor `sanitizeMatColumnName` list.
+ */
+export const MANAGED_WAREHOUSE_SQL_KEYWORD_BLOCKLIST: ReadonlySet<string> =
+  new Set([
+    "select",
+    "from",
+    "where",
+    "order",
+    "having",
+    "limit",
+    "offset",
+    "join",
+    "on",
+    "using",
+    "as",
+    "distinct",
+    "union",
+    "if",
+    "then",
+    "else",
+    "end",
+    "case",
+    "when",
+    "and",
+    "or",
+    "not",
+    "true",
+    "false",
+    "null",
+    "is",
+    "in",
+    "between",
+    "exists",
+    "like",
+    "array",
+    "tuple",
+    "map",
+    "cast",
+    "inf",
+    "infinity",
+    "nan",
+    "default",
+    "current_date",
+    "current_timestamp",
+    "sysdate",
+  ]);
+
+/**
+ * Validate that a name is safe to use as an unquoted ClickHouse column name on
+ * a Managed Warehouse datasource. Returns `null` when valid, or a
+ * human-readable error message describing the problem. `reservedColumnNames`
+ * should be the lowercased set of base-table column names that attributes
+ * must not collide with (e.g., `timestamp`, `event_name`, `sdk_version`).
+ */
+export function validateManagedWarehouseColumnName(
+  name: string,
+  reservedColumnNames: ReadonlySet<string>,
+): string | null {
+  if (!CLICKHOUSE_IDENTIFIER_REGEX.test(name)) {
+    return `Attribute name "${name}" can't be used as a Managed Warehouse column — names must start with a letter or underscore and contain only alphanumerics and underscores.`;
+  }
+  const lowered = name.toLowerCase();
+  if (reservedColumnNames.has(lowered)) {
+    return `Attribute name "${name}" collides with a reserved Managed Warehouse column.`;
+  }
+  if (MANAGED_WAREHOUSE_SQL_KEYWORD_BLOCKLIST.has(lowered)) {
+    return `Attribute name "${name}" is a SQL keyword and can't be used as a Managed Warehouse column.`;
+  }
+  return null;
+}
+
+/**
+ * True iff the column's datatype can't be represented by any SDKAttribute.
+ * Pre-refactor ClickHouse warehouses could have columns with datatypes
+ * (`date`, `json`, `other`, `""`) that the old UI allowed but the new
+ * attribute-driven flow can't express. Such columns are orphans in the sense
+ * that no attribute will ever derive them — they're only in the snapshot
+ * because migration carried over the legacy `materializedColumns` verbatim.
+ *
+ * The sync layer uses this to distinguish "orphan because legacy datatype"
+ * (preserve as pass-through) from "orphan because the user deleted the
+ * attribute" (honest delete). `arrayElementType` short-circuits because array
+ * columns only come from post-refactor attributes — if one is orphaned, it's
+ * an explicit delete, not a legacy pass-through.
+ */
+export function isLegacyPassThroughColumn(col: MaterializedColumn): boolean {
+  if (col.arrayElementType) return false;
+  return legacyMaterializedColumnDatatypeToAttribute(col.datatype) === undefined;
 }
 
 /**

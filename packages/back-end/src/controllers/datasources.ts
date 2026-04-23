@@ -299,7 +299,9 @@ export async function postManagedWarehouse(
   }
 
   const attributeSchema = context.org.settings?.attributeSchema || [];
-  const materializedColumns = getWarehouseMaterializedColumns(attributeSchema);
+  const materializedColumns = getWarehouseMaterializedColumns(attributeSchema, {
+    orgId: context.org.id,
+  });
 
   const params = await createClickhouseUser(context, materializedColumns);
   const { userIdTypes, exposureQueries } =
@@ -1195,7 +1197,7 @@ export async function postRecreateManagedWarehouse(
     );
   }
 
-  await _dangerousRecreateClickhouseTables(context, datasource);
+  await _dangerousRecreateClickhouseTables(context);
 
   res.status(200).json({
     status: 200,

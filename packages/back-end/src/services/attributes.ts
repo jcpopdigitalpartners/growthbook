@@ -1,5 +1,8 @@
 import { SDKAttribute } from "shared/types/organization";
+import { validateManagedWarehouseColumnName } from "shared/util";
+import { getGrowthbookDatasource } from "back-end/src/models/DataSourceModel";
 import { updateOrganization } from "back-end/src/models/OrganizationModel";
+import { getReservedColumnNames } from "back-end/src/services/clickhouse";
 import {
   ensureManagedWarehouseAttributesMigrated,
   syncManagedWarehouseAttributes,
@@ -41,9 +44,17 @@ export async function updateAttributeSchema(
   {
     nextAttributeSchema,
     renames = [],
+    skipManagedWarehouseNameValidation = false,
   }: {
     nextAttributeSchema: SDKAttribute[];
     renames?: { from: string; to: string }[];
+    /**
+     * Bypass the Managed Warehouse column-name validation. Intended for
+     * system-triggered paths (e.g. `$groups` auto-add) where we accept that
+     * the attribute won't materialize — `deriveMaterializedColumnsFromAttributes`
+     * will silently skip invalid names downstream.
+     */
+    skipManagedWarehouseNameValidation?: boolean;
   },
 ): Promise<void> {
   const { org } = context;
@@ -65,6 +76,28 @@ export async function updateAttributeSchema(
 
   const previousAttributeSchema = org.settings?.attributeSchema || [];
 
+  // Reject newly-introduced attribute names that can't be materialized on a
+  // Managed Warehouse. Existing attrs are grandfathered (they'll be silently
+  // skipped by derive) so previously-accepted names don't start blocking
+  // unrelated attribute edits. Only runs when the org has a Managed Warehouse.
+  if (!skipManagedWarehouseNameValidation) {
+    const managedWarehouse = await getGrowthbookDatasource(context);
+    if (managedWarehouse) {
+      const previousProperties = new Set(
+        previousAttributeSchema.map((a) => a.property),
+      );
+      const reservedColumnNames = getReservedColumnNames();
+      for (const attr of nextAttributeSchema) {
+        if (previousProperties.has(attr.property)) continue;
+        const reason = validateManagedWarehouseColumnName(
+          attr.property,
+          reservedColumnNames,
+        );
+        if (reason !== null) throw new Error(reason);
+      }
+    }
+  }
+
   await updateOrganization(org.id, {
     settings: { ...org.settings, attributeSchema: nextAttributeSchema },
   });
@@ -76,6 +109,12 @@ export async function updateAttributeSchema(
     });
   } catch (e) {
     try {
+      // `previousAttributeSchema` is the post-migration schema (read after
+      // `ensureManagedWarehouseAttributesMigrated` ran), not the true
+      // pre-request state. That's intentional: the migration is one-way and
+      // idempotent, and a subsequent attribute write against the backfilled
+      // schema is a no-op diff. We're rolling the user's requested edit back,
+      // not the migration.
       await updateOrganization(org.id, {
         settings: { ...org.settings, attributeSchema: previousAttributeSchema },
       });

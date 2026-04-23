@@ -3,8 +3,10 @@ import type { MaterializedColumn } from "../../types/datasource";
 import {
   computeMaterializedColumnDiff,
   deriveMaterializedColumnsFromAttributes,
+  isLegacyPassThroughColumn,
   materializedColumnTypeFromAttribute,
   planManagedWarehouseAttributeMigration,
+  validateManagedWarehouseColumnName,
 } from "../../src/util/managed-warehouse-attributes";
 
 describe("materializedColumnTypeFromAttribute", () => {
@@ -383,5 +385,131 @@ describe("planManagedWarehouseAttributeMigration", () => {
     });
     expect(result.additions.map((a) => a.property)).toEqual(["my_custom_attr"]);
     expect(result.skipped).toEqual([]);
+  });
+});
+
+describe("validateManagedWarehouseColumnName", () => {
+  const reserved = new Set(["timestamp", "event_name"]);
+
+  it("returns null for valid identifiers", () => {
+    expect(validateManagedWarehouseColumnName("foo", reserved)).toBeNull();
+    expect(validateManagedWarehouseColumnName("_foo", reserved)).toBeNull();
+    expect(validateManagedWarehouseColumnName("foo_bar_42", reserved)).toBeNull();
+  });
+
+  it("rejects names that don't match the identifier regex", () => {
+    expect(validateManagedWarehouseColumnName("$groups", reserved)).toMatch(
+      /letter or underscore/,
+    );
+    expect(validateManagedWarehouseColumnName("user.id", reserved)).toMatch(
+      /letter or underscore/,
+    );
+    expect(validateManagedWarehouseColumnName("user id", reserved)).toMatch(
+      /letter or underscore/,
+    );
+    expect(validateManagedWarehouseColumnName("1foo", reserved)).toMatch(
+      /letter or underscore/,
+    );
+    expect(validateManagedWarehouseColumnName("", reserved)).toMatch(
+      /letter or underscore/,
+    );
+  });
+
+  it("rejects reserved column names case-insensitively", () => {
+    expect(validateManagedWarehouseColumnName("timestamp", reserved)).toMatch(
+      /reserved/,
+    );
+    expect(validateManagedWarehouseColumnName("TIMESTAMP", reserved)).toMatch(
+      /reserved/,
+    );
+    expect(validateManagedWarehouseColumnName("event_name", reserved)).toMatch(
+      /reserved/,
+    );
+  });
+
+  it("rejects SQL keywords case-insensitively", () => {
+    expect(validateManagedWarehouseColumnName("select", reserved)).toMatch(
+      /SQL keyword/,
+    );
+    expect(validateManagedWarehouseColumnName("FROM", reserved)).toMatch(
+      /SQL keyword/,
+    );
+    expect(validateManagedWarehouseColumnName("case", reserved)).toMatch(
+      /SQL keyword/,
+    );
+  });
+});
+
+describe("deriveMaterializedColumnsFromAttributes invalid-name skipping", () => {
+  it("returns everything by default (no validation)", () => {
+    const attrs: SDKAttribute[] = [
+      { property: "valid", datatype: "string" },
+      { property: "$groups", datatype: "string[]" },
+    ];
+    const result = deriveMaterializedColumnsFromAttributes(attrs);
+    expect(result.map((c) => c.columnName)).toEqual(["valid", "$groups"]);
+  });
+
+  it("skips invalid names when reservedColumnNames is passed", () => {
+    const reserved = new Set(["timestamp"]);
+    const skipped: string[] = [];
+    const attrs: SDKAttribute[] = [
+      { property: "valid", datatype: "string" },
+      { property: "$groups", datatype: "string[]" },
+      { property: "timestamp", datatype: "string" },
+      { property: "select", datatype: "string" },
+      { property: "user.id", datatype: "string" },
+    ];
+    const result = deriveMaterializedColumnsFromAttributes(attrs, {
+      reservedColumnNames: reserved,
+      onInvalidAttribute: (attr) => skipped.push(attr.property),
+    });
+    expect(result.map((c) => c.columnName)).toEqual(["valid"]);
+    expect(skipped).toEqual(["$groups", "timestamp", "select", "user.id"]);
+  });
+
+  it("allows underscore-prefixed names", () => {
+    const result = deriveMaterializedColumnsFromAttributes(
+      [{ property: "_foo", datatype: "string" }],
+      { reservedColumnNames: new Set() },
+    );
+    expect(result.map((c) => c.columnName)).toEqual(["_foo"]);
+  });
+});
+
+describe("isLegacyPassThroughColumn", () => {
+  const col = (overrides: Partial<MaterializedColumn>): MaterializedColumn => ({
+    columnName: "c",
+    sourceField: "c",
+    datatype: "string",
+    ...overrides,
+  });
+
+  it("returns false for attribute-representable scalar datatypes", () => {
+    expect(isLegacyPassThroughColumn(col({ datatype: "string" }))).toBe(false);
+    expect(isLegacyPassThroughColumn(col({ datatype: "number" }))).toBe(false);
+    expect(isLegacyPassThroughColumn(col({ datatype: "boolean" }))).toBe(false);
+  });
+
+  it("returns true for unmappable datatypes", () => {
+    expect(isLegacyPassThroughColumn(col({ datatype: "date" }))).toBe(true);
+    expect(isLegacyPassThroughColumn(col({ datatype: "json" }))).toBe(true);
+    expect(isLegacyPassThroughColumn(col({ datatype: "other" }))).toBe(true);
+    expect(isLegacyPassThroughColumn(col({ datatype: "" }))).toBe(true);
+  });
+
+  it("returns false for array columns regardless of datatype", () => {
+    // Array columns are post-refactor only; orphaned ones are intentional
+    // deletes, not legacy pass-throughs.
+    expect(
+      isLegacyPassThroughColumn(
+        col({ datatype: "string", arrayElementType: "string" }),
+      ),
+    ).toBe(false);
+    expect(
+      isLegacyPassThroughColumn(
+        col({ datatype: "number", arrayElementType: "number" }),
+      ),
+    ).toBe(false);
   });
 });

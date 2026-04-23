@@ -5,7 +5,7 @@ import {
 } from "shared/types/datasource";
 import { MANAGED_WAREHOUSE_EVENTS_FACT_TABLE_ID } from "shared/constants";
 import type { ReqContext } from "back-end/types/request";
-import { updateMaterializedColumns } from "back-end/src/services/clickhouse";
+import { _updateMaterializedColumnsUnsafe } from "back-end/src/services/clickhouse";
 import {
   getFactTablesForDatasource,
   updateFactTableColumns,
@@ -82,7 +82,7 @@ function makeFactTable(columns: ColumnInterface[]): FactTableInterface {
   } as unknown as FactTableInterface;
 }
 
-describe("updateMaterializedColumns", () => {
+describe("_updateMaterializedColumnsUnsafe", () => {
   const context = {
     org: { id: "org_test" },
   } as unknown as ReqContext;
@@ -119,7 +119,7 @@ describe("updateMaterializedColumns", () => {
       },
     ];
 
-    await updateMaterializedColumns({
+    await _updateMaterializedColumnsUnsafe({
       context,
       datasource,
       columnsToAdd: finalColumns,
@@ -158,7 +158,7 @@ describe("updateMaterializedColumns", () => {
       },
     ];
 
-    await updateMaterializedColumns({
+    await _updateMaterializedColumnsUnsafe({
       context,
       datasource,
       columnsToAdd: [],
