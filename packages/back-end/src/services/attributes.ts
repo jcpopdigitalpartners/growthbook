@@ -90,7 +90,7 @@ export async function updateAttributeSchema(
       for (const attr of newAttributeSchema) {
         if (previousProperties.has(attr.property)) continue;
         const reason = validateManagedWarehouseColumnName(attr.property);
-        if (reason !== null) throw new Error(reason);
+        if (reason) throw new Error(reason);
       }
     }
   }
