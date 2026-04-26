@@ -18,14 +18,14 @@ settings yourself.
 
 When you run an experiment, you need to choose who will get the experiment, and what percentage
 those users should get each variation. In GrowthBook, we allow you to pick overall exposure
-percentage, as well as customize the split per variation. Yor can also target an experiment at just some
+percentage, as well as customize the split per variation. You can also target an experiment at specific
 attribute values.
 
 GrowthBook uses deterministic hashing to do the assignment. That means that each user’s hashing
 attribute (usually user id), and the experiment name, are hashed together to get a number from 0 to 1.
 This number will always be the same for the same set of inputs.
 
-There is quite often a need to de-risk a new A/B test by running the control at a higher percentage of
+Quite often there is a need to de-risk a new A/B test by running the control at a higher percentage of
 users than the new variation, for example, 80% of users get the control, and 20% get the new variation.
 To solve this case, we recommend keeping the experiment spits equal, and adjusting the overall
 exposure (ie, 20% exposure, 50/50 on each variation, so each variation gets 10%). This way the overall
@@ -34,29 +34,27 @@ exposure can be ramped up (or down) without having any users potentially switch 
 ## Metric selection
 
 GrowthBook lets you choose goal metrics, secondary metrics, and guardrail metrics. Goal metrics are the metrics you’re
-trying to improve or measure the impact of the change of your experiment.
-Secondary metrics are used to learn about experiment impacts, but are not primary objectives. Guardrail metrics are
-metrics you’re trying not to hurt.
+trying to improve or measure the impact of the change from your experiment.
+Secondary metrics are used to learn about experiment impacts, but are not primary objectives. Guardrail metrics are your “don’t break this” metrics. They help you confirm that a winning experiment is not quietly damaging something important.
 
 <MaxWidthImage maxWidth={600}>
   ![GrowthBook Metric Selector](/images/using/metrics-modal.png)
 </MaxWidthImage>
 
-It is best to pick metrics for your experiment that are as close to your treatment as possible, and, if possible, the event itself. For
+It is best to choose experiment metrics that are as close as possible to the treatment— and, ideally, measure the event itself. For
 example, if you’re trying to improve a signup rate, you can add product review metrics that are close to
 that event, like "signup modal open rate", and "signup conversion rate". You can add as many metrics as you
-like to your experiment, but we suggest each experiment have only a few primary metrics that are used for
+need to your experiment, but we suggest each experiment have only a few primary metrics that are used for
 making the shipping decision. Adding all your metrics is not recommended, as this can lead to false
 positives caused by random variations (see [Multiple testing problem](/using/experimentation-problems#multiple-testing-problem))
 
 Before running a test, select a primary metric or set of metrics that you're
-trying to improve. These metrics are often called the OEC for Overall Evaluation Criterion. It is
+trying to improve. These metrics are often referred to as the OEC for Overall Evaluation Criterion. It is
 important to have this decided ahead of time so when you look at your experiment results you're not just shopping for metrics that confirm
 your bias (see [confirmation bias](/using/experimentation-problems#confirmation-bias)).
 
-With GrowthBook, Goal and guardrail metrics can be added retroactively to experiments, as long as
-the data exists in your data warehouse. This allows you to reprocess old experiments if you add new
-metrics or redefine a metric.
+With GrowthBook, goal and guardrail metrics can be added retroactively to experiments, as long as
+the data exists in your data warehouse. This lets you reprocess past experiments after adding or redefining metrics.
 
 ## Activation metrics
 
